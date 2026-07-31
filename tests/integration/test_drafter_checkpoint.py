@@ -1,9 +1,23 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
 
 import pytest
 
+from verl_speco.trainer import checkpoint as checkpoint_utils
 from verl_speco.trainer.checkpoint import (
     DrafterCheckpointMetadataError,
     get_drafter_checkpoint_metadata,
@@ -11,7 +25,9 @@ from verl_speco.trainer.checkpoint import (
     get_drafter_optimizer_checkpoint_path,
     get_drafter_trainer_state,
     is_pretrained_drafter_checkpoint,
+    release_checkpoint_host_memory,
     resolve_drafter_checkpoint_path,
+    trim_process_host_memory,
 )
 
 
@@ -39,7 +55,9 @@ def test_drafter_checkpoint_reads_nested_trainer_state(tmp_path) -> None:
 def test_drafter_checkpoint_keeps_old_metadata_compatible(tmp_path) -> None:
     checkpoint = tmp_path / "draft_step_12"
     checkpoint.mkdir()
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 12}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 12}), encoding="utf-8"
+    )
 
     assert get_drafter_checkpoint_step(checkpoint) == 12
     assert get_drafter_trainer_state(checkpoint) == {}
@@ -53,9 +71,13 @@ def test_resolve_drafter_checkpoint_path_matches_resumed_global_step(tmp_path) -
     checkpoint.mkdir(parents=True)
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 20}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 20}), encoding="utf-8"
+    )
 
-    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(checkpoint)
+    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(
+        checkpoint
+    )
 
 
 def test_corrupt_metadata_fails_closed(tmp_path) -> None:
@@ -65,9 +87,13 @@ def test_corrupt_metadata_fails_closed(tmp_path) -> None:
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
     (checkpoint / "metadata.json").write_text("{not-json", encoding="utf-8")
 
-    with pytest.raises(DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"):
+    with pytest.raises(
+        DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"
+    ):
         get_drafter_checkpoint_step(checkpoint)
-    with pytest.raises(DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"):
+    with pytest.raises(
+        DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"
+    ):
         is_pretrained_drafter_checkpoint(checkpoint)
 
 
@@ -115,6 +141,75 @@ def test_resolve_rejects_checkpoint_with_mismatched_metadata_step(tmp_path) -> N
     checkpoint.mkdir(parents=True)
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 19}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 19}), encoding="utf-8"
+    )
 
-    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(original_model)
+    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(
+        original_model
+    )
+
+
+def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) -> None:
+    checkpoint = tmp_path / "actor"
+    checkpoint.mkdir()
+    (checkpoint / "model.bin").write_bytes(b"weights")
+    events = []
+    monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint._trim_process_heap",
+        lambda: events.append("trim") or True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint._flush_and_drop_checkpoint_file_cache",
+        lambda path: events.append(("drop", path)) or (1, 0),
+    )
+
+    result = release_checkpoint_host_memory(checkpoint, drop_file_cache=True)
+
+    assert events == ["gc", "trim", ("drop", str(checkpoint))]
+    assert result["heap_trimmed"] is True
+    assert result["files_advised"] == 1
+    assert result["files_failed"] == 0
+
+
+def test_process_heap_reclaim_prefers_jemalloc(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(checkpoint_utils.sys, "platform", "linux")
+    monkeypatch.setattr(checkpoint_utils, "_jemalloc_is_active", lambda: True)
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "_reclaim_jemalloc_heap",
+        lambda: events.append("jemalloc") or True,
+    )
+
+    assert checkpoint_utils._trim_process_heap() is True
+    assert events == ["jemalloc"]
+
+
+def test_jemalloc_reclaim_flushes_tcache_and_decays_all_arenas(monkeypatch) -> None:
+    controls = []
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "_jemalloc_mallctl",
+        lambda name: controls.append(name) or True,
+    )
+    monkeypatch.delenv("SPECO_JEMALLOC_RECLAIM_MODE", raising=False)
+
+    assert checkpoint_utils._reclaim_jemalloc_heap() is True
+    assert controls == ["thread.tcache.flush", "arena.4096.decay"]
+
+
+def test_trim_process_host_memory_reports_allocator(monkeypatch) -> None:
+    monkeypatch.setattr(checkpoint_utils, "_host_allocator_name", lambda: "jemalloc")
+    monkeypatch.setattr(checkpoint_utils, "_trim_process_heap", lambda: True)
+    monkeypatch.setenv("SPECO_JEMALLOC_RECLAIM_MODE", "invalid")
+
+    result = trim_process_host_memory()
+
+    assert result["heap_trimmed"] is True
+    assert result["allocator"] == "jemalloc"
+    assert result["reclaim_action"] == "decay"
