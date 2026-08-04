@@ -70,7 +70,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.vllm.allow_lossy_speculative_sampling is False
     assert drafter.training.allow_sglang_prenorm_last_layer is False
     assert drafter.training.lr == pytest.approx(1e-5)
-    assert drafter.training.lr_scheduler_type == "constant"
+    assert drafter.training.lr_scheduler_type == "global_cosine"
     assert drafter.training.lr_decay_steps == 100
     assert drafter.training.min_lr_ratio == pytest.approx(0.1)
     assert drafter.training.warmup_style is None

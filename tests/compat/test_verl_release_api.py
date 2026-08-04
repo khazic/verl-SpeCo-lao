@@ -144,11 +144,6 @@ def test_release_v080_modules_and_symbols_are_present() -> None:
     if not upstream_root:
         pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.8.0 API")
 
-    # REQUIRED_MODULES keys already start with the ``verl`` package segment
-    # (e.g. ``verl.trainer.main_ppo``), so the root must be the directory that
-    # CONTAINS the ``verl`` package, never ``<root>/verl`` itself, which would
-    # double the segment into ``<root>/verl/verl/...`` and report every module
-    # as missing. _upstream_repo_root picks that directory for both layouts.
     root = _upstream_repo_root(upstream_root)
     missing: list[str] = []
     for module_name, symbols in REQUIRED_MODULES.items():
