@@ -86,35 +86,37 @@ class DFlash2TrainingModel(DFlashTrainingModel):
 
         # The selector can only learn on rows whose ground truth survived the
         # drafter's own top-k; elsewhere there is no correct choice to make.
+        # Those rows are zero-weighted rather than sliced out, so the autograd
+        # graph covers the same parameters on every rank. Slicing here would
+        # make the selector parameters receive gradients only on the ranks that
+        # happened to have coverage this step, which desyncs the FSDP2/DDP
+        # gradient reduction.
         target_hits = candidates == active_targets.unsqueeze(-1)
         learnable = target_hits.any(dim=-1)
-        selector_loss = torch.zeros((), dtype=torch.float32, device=device)
-        selector_correct = torch.zeros((), dtype=torch.float32, device=device)
-        selector_tokens = torch.zeros((), dtype=torch.float32, device=device)
-        if bool(learnable.any()):
-            learn_scores = scores[learnable]
-            learn_weights = active_weights[learnable].float()
-            learn_targets = torch.argmax(target_hits[learnable].int(), dim=-1)
-            per_row = F.cross_entropy(learn_scores, learn_targets, reduction="none")
-            finite = torch.isfinite(per_row)
-            per_row = torch.where(finite, per_row, torch.zeros_like(per_row))
-            learn_weights = learn_weights * finite.to(learn_weights.dtype)
-            selector_loss = (per_row * learn_weights).sum() / learn_weights.sum().clamp(
-                min=1e-6
-            )
-            with torch.no_grad():
-                selector_tokens = finite.float().sum()
-                selector_correct = (
-                    ((torch.argmax(learn_scores, dim=-1) == learn_targets) & finite)
-                    .float()
-                    .sum()
-                )
+        # argmax over an all-False row yields 0; the row is masked out below.
+        row_targets = torch.argmax(target_hits.int(), dim=-1)
+        per_row = F.cross_entropy(scores, row_targets, reduction="none")
+        finite = torch.isfinite(per_row)
+        per_row = torch.where(finite, per_row, torch.zeros_like(per_row))
+        row_weights = (
+            active_weights.float()
+            * learnable.to(torch.float32)
+            * finite.to(torch.float32)
+        )
+        selector_loss = (per_row * row_weights).sum() / row_weights.sum().clamp(
+            min=1e-6
+        )
 
         with torch.no_grad():
+            scored = learnable & finite
             metrics = {
                 "selector_loss": selector_loss.detach().float(),
-                "selector_correct_count": selector_correct,
-                "selector_token_count": selector_tokens,
+                "selector_correct_count": (
+                    (torch.argmax(scores, dim=-1) == row_targets) & scored
+                )
+                .float()
+                .sum(),
+                "selector_token_count": scored.float().sum(),
                 "selector_coverage_count": learnable.float().sum(),
                 "selector_active_count": torch.tensor(
                     float(active_targets.numel()), dtype=torch.float32, device=device
@@ -134,17 +136,20 @@ class DFlash2TrainerBackend(DFlashTrainerBackend):
             return value
         return training_cfg.get(dflash_key, default)
 
-    def _normalize_dflash_config(
-        self, drafter_config, target_hf_config, normalized_state, spec_model_path
-    ):
+    def _resolved_block_size(self, drafter_config) -> int:
+        """Single source of truth for the block size.
+
+        The convolutions are built from ``drafter_config.block_size`` while the
+        training wrapper takes its own ``dflash2_block_size``. If those disagree
+        the conv's notion of a block spans several anchor blocks, and its causal
+        tap silently reads across an anchor boundary without tripping the
+        block-multiple guard. Resolve once and apply to both.
+        """
         training_cfg = self.config.rollout.drafter.training
-        if training_cfg.get("dflash2_num_target_layers", None) is not None:
-            if getattr(drafter_config, "num_context_layers", None) is None:
-                drafter_config.num_context_layers = int(
-                    training_cfg["dflash2_num_target_layers"]
-                )
-        return super()._normalize_dflash_config(
-            drafter_config, target_hf_config, normalized_state, spec_model_path
+        return int(
+            training_cfg.get(
+                "dflash2_block_size", getattr(drafter_config, "block_size", 8)
+            )
         )
 
     def _build_fallback_config(self, target_hf_config):
@@ -257,6 +262,10 @@ class DFlash2TrainerBackend(DFlashTrainerBackend):
         drafter_config = self._normalize_dflash_config(
             drafter_config, target_hf_config, normalized_state, spec_model_path
         )
+        # Pin the config's block size to the one the trainer will use, so the
+        # convolutions and the block layout cannot drift apart.
+        block_size = self._resolved_block_size(drafter_config)
+        drafter_config.block_size = block_size
 
         draft_model = DFlash2DraftModel(deepcopy(drafter_config))
         if (
@@ -276,11 +285,7 @@ class DFlash2TrainerBackend(DFlashTrainerBackend):
         training_cfg = self.config.rollout.drafter.training
         return DFlash2TrainingModel(
             draft_model=draft_model,
-            block_size=int(
-                training_cfg.get(
-                    "dflash2_block_size", getattr(drafter_config, "block_size", 8)
-                )
-            ),
+            block_size=block_size,
             num_anchors=int(
                 training_cfg.get(
                     "dflash2_num_anchors", getattr(drafter_config, "num_anchors", 512)

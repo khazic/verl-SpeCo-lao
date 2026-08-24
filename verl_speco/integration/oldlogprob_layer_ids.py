@@ -180,7 +180,11 @@ def _build_dflash_target_layer_ids(
 
 
 def _dflash_num_context_layers(
-    drafter_cfg: Any, model_configs: tuple[Any, ...], *, is_dspark: bool = False
+    drafter_cfg: Any,
+    model_configs: tuple[Any, ...],
+    *,
+    is_dspark: bool = False,
+    is_dflash2: bool = False,
 ) -> int:
     training_cfg = _get_nested(drafter_cfg, ("training",), {}) or {}
     candidates = []
@@ -188,8 +192,14 @@ def _dflash_num_context_layers(
         candidates.append(
             _get_nested(training_cfg, ("dspark_num_target_layers",), None)
         )
+    # Variant-specific knobs must be gated on the running algorithm: the base
+    # YAML defines every variant's *_num_target_layers unconditionally, so an
+    # ungated entry would let one variant's default shadow another's.
+    if is_dflash2:
+        candidates.append(
+            _get_nested(training_cfg, ("dflash2_num_target_layers",), None)
+        )
     candidates.append(_get_nested(training_cfg, ("domino_num_target_layers",), None))
-    candidates.append(_get_nested(training_cfg, ("dflash2_num_target_layers",), None))
     candidates.extend(
         (
             _get_nested(training_cfg, ("dflash_num_target_layers",), None),
@@ -290,7 +300,12 @@ def resolve_oldlogprob_aux_layer_ids(
         if target_num_hidden_layers is None:
             return None
         return _build_dflash_target_layer_ids(
-            _dflash_num_context_layers(drafter_cfg, model_configs, is_dspark=is_dspark),
+            _dflash_num_context_layers(
+                drafter_cfg,
+                model_configs,
+                is_dspark=is_dspark,
+                is_dflash2=algorithm == "DFLASH2",
+            ),
             int(target_num_hidden_layers),
         )
 

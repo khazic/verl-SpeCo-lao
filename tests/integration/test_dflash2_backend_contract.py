@@ -4,7 +4,7 @@ CPU-light: they exercise the two DFlash2 modules (the two-tap dynamic
 convolution and the candidate selector), the block-locality invariant the
 training layout requires, the algorithm routing, and the block-drafter
 classification. The full training forward is validated on GPU by
-``ci/dflash2_gpu_smoke.py``.
+``tests/special_standalone/dflash2_gpu_smoke.py``.
 """
 
 from __future__ import annotations
@@ -100,6 +100,7 @@ def test_conv_is_identity_at_init() -> None:
     start numerically equal to DFlash rather than perturbing the backbone.
     """
     pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     import torch
 
     from verl_speco.models.dflash2 import GroupedDynamicCausalConv
@@ -121,6 +122,7 @@ def test_conv_does_not_leak_across_block_boundaries() -> None:
     final position of block i-1, which belongs to an unrelated anchor.
     """
     pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     import torch
 
     from verl_speco.models.dflash2 import GroupedDynamicCausalConv
@@ -149,6 +151,7 @@ def test_conv_does_not_leak_across_block_boundaries() -> None:
 
 def test_conv_rejects_length_that_is_not_a_block_multiple() -> None:
     pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     import torch
 
     from verl_speco.models.dflash2 import GroupedDynamicCausalConv
@@ -167,6 +170,7 @@ def test_selector_pair_scores_match_the_sequential_selector() -> None:
     sequential ``select`` actually took has to reproduce the same scores.
     """
     pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     import torch
 
     from verl_speco.models.dflash2 import CandidateSelector
@@ -258,6 +262,44 @@ def test_dflash2_training_model_rejects_restricted_vocab() -> None:
             num_anchors=config.num_anchors,
             loss_mode="restricted_ce",
         )
+
+
+def test_backend_pins_conv_block_size_to_the_trainer_block_size() -> None:
+    """The convs and the trainer must not disagree about the block size.
+
+    The convs are built from the drafter config while the training wrapper takes
+    its own ``dflash2_block_size``. If the training value is a multiple of the
+    config value, ``_to_block_local``'s guard still passes but each conv "block"
+    spans several anchor blocks, so the causal tap reads across an anchor
+    boundary: exactly the leak the module is supposed to prevent, silently.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    backend = DFlash2TrainerBackend(
+        OmegaConf.create(
+            {
+                "rollout": {
+                    "drafter": {
+                        "speculative_algorithm": "DFLASH2",
+                        "model_path": "",
+                        # Deliberately a multiple of the config's block_size=4,
+                        # so the block-multiple guard alone would not catch it.
+                        "training": {"dflash2_block_size": 8},
+                    }
+                },
+                "model": {"path": ""},
+            }
+        ),
+        None,
+    )
+    config = _tiny_dflash2_config(block_size=4)
+    assert isinstance(config, DFlash2Config)
+    assert backend._resolved_block_size(config) == 8
 
 
 def test_dflash2_backend_is_registered_in_the_factory() -> None:

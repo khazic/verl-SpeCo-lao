@@ -948,6 +948,12 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            # DFlash2 candidate selector.
+            "selector_loss": f"{prefix}/selector_loss",
+            "selector_correct_count": f"{prefix}/selector_correct_count",
+            "selector_token_count": f"{prefix}/selector_token_count",
+            "selector_coverage_count": f"{prefix}/selector_coverage_count",
+            "selector_active_count": f"{prefix}/selector_active_count",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
