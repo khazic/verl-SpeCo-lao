@@ -951,6 +951,7 @@ class DrafterBaseTrainer:
             # DFlash2 candidate selector.
             "selector_loss": f"{prefix}/selector_loss",
             "selector_correct_count": f"{prefix}/selector_correct_count",
+            "selector_base_correct_count": f"{prefix}/selector_base_correct_count",
             "selector_token_count": f"{prefix}/selector_token_count",
             "selector_coverage_count": f"{prefix}/selector_coverage_count",
             "selector_active_count": f"{prefix}/selector_active_count",

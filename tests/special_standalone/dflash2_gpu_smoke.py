@@ -174,6 +174,10 @@ def main() -> None:
             sel_loss = float(d["selector_loss"])
             sel_tokens = max(float(d["selector_token_count"]), 1.0)
             sel_acc = float(d["selector_correct_count"]) / sel_tokens
+            # Unary-only ranking on the same rows. The selector's score starts
+            # from the drafter's own logit, so this is the baseline it has to
+            # beat; sel_acc alone says nothing once the backbone converges.
+            base_acc = float(d["selector_base_correct_count"]) / sel_tokens
             coverage = float(d["selector_coverage_count"]) / max(
                 float(d["selector_active_count"]), 1.0
             )
@@ -182,6 +186,7 @@ def main() -> None:
             print(
                 f"[smoke] step {step:3d}  loss={total:.4f}  acc={acc:.4f}  "
                 f"selector_loss={sel_loss:.4f}  selector_acc={sel_acc:.4f}  "
+                f"unary_only_acc={base_acc:.4f}  lift={sel_acc - base_acc:+.4f}  "
                 f"selector_coverage={coverage:.4f}"
             )
 

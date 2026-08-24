@@ -109,10 +109,21 @@ class DFlash2TrainingModel(DFlashTrainingModel):
 
         with torch.no_grad():
             scored = learnable & finite
+            # Control for the selector's own accuracy. S_t(a, b) starts from the
+            # drafter's logit U_t(b), so once the backbone ranks the truth first
+            # on its own the selector scores perfectly without the bilinear term
+            # having learned anything. Measuring the unary-only ranking on the
+            # same rows is what isolates the selector's actual contribution:
+            # the lift is selector_correct_count - selector_base_correct_count.
             metrics = {
                 "selector_loss": selector_loss.detach().float(),
                 "selector_correct_count": (
                     (torch.argmax(scores, dim=-1) == row_targets) & scored
+                )
+                .float()
+                .sum(),
+                "selector_base_correct_count": (
+                    (torch.argmax(unary, dim=-1) == row_targets) & scored
                 )
                 .float()
                 .sum(),
