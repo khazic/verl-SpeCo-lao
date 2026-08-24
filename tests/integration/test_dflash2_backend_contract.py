@@ -1,0 +1,346 @@
+"""Contract tests for the DFlash2 drafter backend.
+
+CPU-light: they exercise the two DFlash2 modules (the two-tap dynamic
+convolution and the candidate selector), the block-locality invariant the
+training layout requires, the algorithm routing, and the block-drafter
+classification. The full training forward is validated on GPU by
+``ci/dflash2_gpu_smoke.py``.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+def _tiny_dflash2_config(**overrides):
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    kwargs = dict(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        block_size=4,
+        num_anchors=8,
+        conv_kernel_size=2,
+        conv_group_size=4,
+        selector_rank=6,
+        selector_top_k=5,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=64,
+    )
+    kwargs.update(overrides)
+    return DFlash2Config(**kwargs)
+
+
+def test_dflash2_model_builds_conv_and_selector() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    config = _tiny_dflash2_config()
+    model = DFlash2DraftModel(config)
+
+    # Every layer gets a conv around attention and around the MLP.
+    for layer in model.layers:
+        assert layer.attention_conv is not None
+        assert layer.mlp_conv is not None
+        assert layer.attention_conv.kernel_size == config.conv_kernel_size
+        assert layer.attention_conv.group_size == config.conv_group_size
+        groups = config.hidden_size // config.conv_group_size
+        assert layer.attention_conv.kernel_projection.out_features == (
+            2 * config.conv_kernel_size * groups
+        )
+
+    selector = model.candidate_selector
+    assert selector.predecessor_codebook.num_embeddings == config.vocab_size
+    assert selector.successor_codebook.num_embeddings == config.vocab_size
+    assert selector.hidden_projection.in_features == config.hidden_size
+    assert selector.hidden_projection.out_features == config.selector_rank
+
+
+def test_plain_dflash_layers_keep_conv_hooks_inert() -> None:
+    """The conv hooks live on the shared DFlash layer; DFlash must not use them."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash import DFlashConfig, DFlashDraftModel
+
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+    )
+    model = DFlashDraftModel(config)
+    for layer in model.layers:
+        assert layer.attention_conv is None
+        assert layer.mlp_conv is None
+
+
+def test_conv_is_identity_at_init() -> None:
+    """A freshly built DFlash2 conv must be a passthrough.
+
+    The correction is learned on top of DFlash, so an untrained DFlash2 has to
+    start numerically equal to DFlash rather than perturbing the backbone.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from verl_speco.models.dflash2 import GroupedDynamicCausalConv
+
+    conv = GroupedDynamicCausalConv(
+        hidden_size=8, kernel_size=2, group_size=4, block_size=4
+    )
+    hidden = torch.randn(2, 8, 8)
+    prepared, dynamic = conv.prepare(hidden)
+    torch.testing.assert_close(prepared, hidden)
+    torch.testing.assert_close(conv.finish(hidden, dynamic), hidden)
+
+
+def test_conv_does_not_leak_across_block_boundaries() -> None:
+    """Tap 1 is causal, so it must never read the previous block's last row.
+
+    Training packs ``n_blocks`` blocks into one flat draft sequence. If the
+    convolution ran over that flat axis, position 0 of block i would mix in the
+    final position of block i-1, which belongs to an unrelated anchor.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from verl_speco.models.dflash2 import GroupedDynamicCausalConv
+
+    block_size = 4
+    conv = GroupedDynamicCausalConv(
+        hidden_size=8, kernel_size=2, group_size=4, block_size=block_size
+    )
+    # Make tap 1 the only contributor so any cross-block read is visible.
+    with torch.no_grad():
+        conv.base_kernel[0, 0, :] = 0.0
+        conv.base_kernel[0, 1, :] = 1.0
+
+    hidden = torch.randn(1, 2 * block_size, 8)
+    out, _ = conv.prepare(hidden)
+
+    # First row of each block has no in-block predecessor, so it must be zero.
+    torch.testing.assert_close(out[:, 0], torch.zeros_like(out[:, 0]))
+    torch.testing.assert_close(
+        out[:, block_size], torch.zeros_like(out[:, block_size])
+    )
+    # Interior rows read their own block's previous row.
+    torch.testing.assert_close(out[:, 1], hidden[:, 0])
+    torch.testing.assert_close(out[:, block_size + 1], hidden[:, block_size])
+
+
+def test_conv_rejects_length_that_is_not_a_block_multiple() -> None:
+    pytest.importorskip("torch")
+    import torch
+
+    from verl_speco.models.dflash2 import GroupedDynamicCausalConv
+
+    conv = GroupedDynamicCausalConv(
+        hidden_size=8, kernel_size=2, group_size=4, block_size=4
+    )
+    with pytest.raises(ValueError, match="multiple of block_size"):
+        conv.prepare(torch.randn(1, 6, 8))
+
+
+def test_selector_pair_scores_match_the_sequential_selector() -> None:
+    """The vectorized training path must agree with the inference-time trace.
+
+    ``pair_scores`` teacher-forces the predecessor; feeding it the path the
+    sequential ``select`` actually took has to reproduce the same scores.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from verl_speco.models.dflash2 import CandidateSelector
+
+    torch.manual_seed(0)
+    config = _tiny_dflash2_config()
+    selector = CandidateSelector(config)
+
+    batch, block = 2, config.block_size
+    hidden = torch.randn(batch, block, config.hidden_size)
+    logits = torch.randn(batch, block, config.vocab_size)
+    anchor_ids = torch.randint(0, config.vocab_size, (batch,))
+
+    path, candidates = selector.select(hidden, logits, anchor_ids)
+    assert path.shape == (batch, block)
+
+    # Rebuild the predecessor sequence the trace used: anchor, then its choices.
+    predecessors = torch.cat([anchor_ids.unsqueeze(1), path[:, :-1]], dim=1)
+    top_k = candidates.shape[-1]
+    unary = torch.gather(logits, 2, candidates)
+    with torch.no_grad():
+        flat_scores = selector.pair_scores(
+            hidden.reshape(-1, config.hidden_size),
+            unary.reshape(-1, top_k),
+            candidates.reshape(-1, top_k),
+            predecessors.reshape(-1),
+        ).reshape(batch, block, top_k)
+    replayed = torch.gather(
+        candidates, 2, flat_scores.argmax(dim=-1, keepdim=True)
+    ).squeeze(-1)
+    torch.testing.assert_close(replayed, path)
+
+
+def test_dflash2_training_model_adds_selector_loss() -> None:
+    """The selector objective must actually contribute to the total loss."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainingModel
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    config = _tiny_dflash2_config()
+    bsz, seq_len = 2, 16
+    input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
+    hidden_states_list = [
+        torch.randn(bsz, seq_len, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
+    loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    def run(selector_loss_weight):
+        torch.manual_seed(0)
+        model = DFlash2TrainingModel(
+            draft_model=DFlash2DraftModel(config),
+            block_size=config.block_size,
+            num_anchors=config.num_anchors,
+            selector_loss_weight=selector_loss_weight,
+        )
+        return model(input_ids, hidden_states_list, loss_mask, lm_head_weight)
+
+    loss_off, _, _, _, _, diagnostics_off = run(0.0)
+    loss_on, _, _, _, _, diagnostics_on = run(1.0)
+
+    assert "selector_loss" not in diagnostics_off
+    assert "selector_loss" in diagnostics_on
+    assert float(diagnostics_on["selector_active_count"]) > 0
+    # With the weight on, the total loss carries the extra selector term.
+    assert float(loss_on) > float(loss_off)
+    assert float(loss_on) == pytest.approx(
+        float(loss_off) + float(diagnostics_on["selector_loss"]), rel=1e-4
+    )
+
+
+def test_dflash2_training_model_rejects_restricted_vocab() -> None:
+    """Selector candidates are real token ids, so a restricted vocab is invalid."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainingModel
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    config = _tiny_dflash2_config()
+    with pytest.raises(ValueError, match="full_vocab"):
+        DFlash2TrainingModel(
+            draft_model=DFlash2DraftModel(config),
+            block_size=config.block_size,
+            num_anchors=config.num_anchors,
+            loss_mode="restricted_ce",
+        )
+
+
+def test_dflash2_backend_is_registered_in_the_factory() -> None:
+    from verl_speco.backends.factory import SUPPORTED_DRAFTER_ALGORITHMS
+
+    assert "DFLASH2" in SUPPORTED_DRAFTER_ALGORITHMS
+
+
+def test_dflash2_uses_dflash_aux_layers() -> None:
+    from verl_speco.integration.oldlogprob_layer_ids import DFLASH_FAMILY_ALGORITHMS
+
+    assert "DFLASH2" in DFLASH_FAMILY_ALGORITHMS
+
+
+def test_dflash2_config_lifts_nested_dflash_config(tmp_path) -> None:
+    """Upstream z-lab checkpoints nest the DFlash2 knobs under dflash_config."""
+    pytest.importorskip("transformers")
+    import json
+
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlash2DraftModel"],
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 32,
+                "dflash_config": {
+                    "block_size": 8,
+                    "conv_kernel_size": 2,
+                    "conv_group_size": 16,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                    "mask_token_id": 31,
+                    "target_layer_ids": [1, 3],
+                },
+            }
+        )
+    )
+
+    config = DFlash2Config.from_dflash2_pretrained(str(tmp_path))
+    assert config.model_type == "dflash2"
+    assert config.block_size == 8
+    assert config.conv_kernel_size == 2
+    assert config.conv_group_size == 16
+    assert config.selector_rank == 256
+    assert config.selector_top_k == 16
+    assert config.mask_token_id == 31
+    assert config.target_layer_ids == [1, 3]
+
+
+def test_dflash2_config_routes_through_auto(tmp_path) -> None:
+    pytest.importorskip("transformers")
+    import json
+
+    from verl_speco.models.auto import AutoDraftModelConfig
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlash2DraftModel"],
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 32,
+                "dflash_config": {"block_size": 8, "selector_top_k": 16},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = AutoDraftModelConfig.from_file(str(config_path))
+    assert isinstance(loaded, DFlash2Config)
+    assert loaded.architectures == ["DFlash2DraftModel"]
+    # The nested z-lab block must survive routing through AutoDraftModelConfig.
+    assert loaded.block_size == 8
+    assert loaded.selector_top_k == 16

@@ -1,0 +1,304 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import logging
+import os
+from copy import deepcopy
+
+import torch
+import torch.nn.functional as F
+
+from verl_speco.backends.dflash_trainer_backend import (
+    DFlashTrainerBackend,
+    DFlashTrainingModel,
+)
+from verl_speco.models.dflash2 import DFlash2Config, DFlash2DraftModel
+from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
+
+logger = logging.getLogger(__name__)
+
+
+class DFlash2TrainingModel(DFlashTrainingModel):
+    """DFlash training wrapper plus the DFlash2 candidate-selector objective.
+
+    The dynamic convolutions live inside the draft model, so they are already
+    exercised by the inherited CE path. Only the selector needs its own loss: it
+    learns to re-rank the drafter's own top-k candidates using the previous
+    token, which at training time is teacher-forced to the ground truth.
+    """
+
+    _no_split_modules = ["DFlashDecoderLayer"]
+
+    def __init__(self, *args, selector_loss_weight: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.selector_loss_weight = float(selector_loss_weight)
+        if self.loss_mode != "full_vocab":
+            raise ValueError(
+                "DFlash2's candidate selector scores real vocabulary ids, so it "
+                f"requires loss_mode='full_vocab'; got {self.loss_mode!r}. A "
+                "restricted/sampled vocabulary would make the selector's "
+                "candidate ids meaningless."
+            )
+
+    def _auxiliary_loss(
+        self,
+        *,
+        input_ids,
+        safe_label_indices,
+        active_mask,
+        active_hidden,
+        active_logits,
+        active_targets,
+        active_weights,
+    ):
+        selector = self.draft_model.candidate_selector
+        if self.selector_loss_weight <= 0:
+            return None, {}
+
+        device = active_hidden.device
+        top_k = min(selector.top_k, active_logits.shape[-1])
+        unary, candidates = torch.topk(active_logits, top_k, dim=-1, sorted=False)
+
+        # Teacher-forced predecessor: the token immediately before the slot this
+        # row predicts. Block-relative position 0 is the anchor and never carries
+        # loss weight, so index - 1 stays inside the sequence for every active row.
+        predecessor_indices = (safe_label_indices - 1).clamp(min=0)
+        bsz, n_blocks, block_size = safe_label_indices.shape
+        flat_predecessor_indices = predecessor_indices.reshape(bsz, -1)
+        predecessor_ids = torch.gather(input_ids, 1, flat_predecessor_indices)
+        predecessor_ids = predecessor_ids.reshape(-1)[active_mask]
+
+        scores = selector.pair_scores(
+            active_hidden, unary.float(), candidates, predecessor_ids
+        )
+
+        # The selector can only learn on rows whose ground truth survived the
+        # drafter's own top-k; elsewhere there is no correct choice to make.
+        target_hits = candidates == active_targets.unsqueeze(-1)
+        learnable = target_hits.any(dim=-1)
+        selector_loss = torch.zeros((), dtype=torch.float32, device=device)
+        selector_correct = torch.zeros((), dtype=torch.float32, device=device)
+        selector_tokens = torch.zeros((), dtype=torch.float32, device=device)
+        if bool(learnable.any()):
+            learn_scores = scores[learnable]
+            learn_weights = active_weights[learnable].float()
+            learn_targets = torch.argmax(target_hits[learnable].int(), dim=-1)
+            per_row = F.cross_entropy(learn_scores, learn_targets, reduction="none")
+            finite = torch.isfinite(per_row)
+            per_row = torch.where(finite, per_row, torch.zeros_like(per_row))
+            learn_weights = learn_weights * finite.to(learn_weights.dtype)
+            selector_loss = (per_row * learn_weights).sum() / learn_weights.sum().clamp(
+                min=1e-6
+            )
+            with torch.no_grad():
+                selector_tokens = finite.float().sum()
+                selector_correct = (
+                    ((torch.argmax(learn_scores, dim=-1) == learn_targets) & finite)
+                    .float()
+                    .sum()
+                )
+
+        with torch.no_grad():
+            metrics = {
+                "selector_loss": selector_loss.detach().float(),
+                "selector_correct_count": selector_correct,
+                "selector_token_count": selector_tokens,
+                "selector_coverage_count": learnable.float().sum(),
+                "selector_active_count": torch.tensor(
+                    float(active_targets.numel()), dtype=torch.float32, device=device
+                ),
+            }
+        return self.selector_loss_weight * selector_loss, metrics
+
+
+class DFlash2TrainerBackend(DFlashTrainerBackend):
+    @property
+    def model_type(self):
+        return "dflash2"
+
+    def _training_value(self, training_cfg, dflash2_key: str, dflash_key: str, default):
+        value = training_cfg.get(dflash2_key, None)
+        if value is not None:
+            return value
+        return training_cfg.get(dflash_key, default)
+
+    def _normalize_dflash_config(
+        self, drafter_config, target_hf_config, normalized_state, spec_model_path
+    ):
+        training_cfg = self.config.rollout.drafter.training
+        if training_cfg.get("dflash2_num_target_layers", None) is not None:
+            if getattr(drafter_config, "num_context_layers", None) is None:
+                drafter_config.num_context_layers = int(
+                    training_cfg["dflash2_num_target_layers"]
+                )
+        return super()._normalize_dflash_config(
+            drafter_config, target_hf_config, normalized_state, spec_model_path
+        )
+
+    def _build_fallback_config(self, target_hf_config):
+        training_cfg = self.config.rollout.drafter.training
+        target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
+        hidden_size_cfg = self._training_value(
+            training_cfg, "dflash2_hidden_size", "dflash_hidden_size", None
+        )
+        hidden_size = int(
+            hidden_size_cfg
+            if hidden_size_cfg is not None
+            else target_text_config.hidden_size
+        )
+        num_context_layers = int(
+            self._training_value(
+                training_cfg, "dflash2_num_target_layers", "dflash_num_target_layers", 5
+            )
+        )
+        target_num_hidden_layers = int(
+            getattr(target_text_config, "num_hidden_layers", 36)
+        )
+        mask_token_id_cfg = self._training_value(
+            training_cfg, "dflash2_mask_token_id", "dflash_mask_token_id", None
+        )
+        mask_token_id = int(
+            mask_token_id_cfg
+            if mask_token_id_cfg is not None
+            else target_text_config.vocab_size - 1
+        )
+        target_layer_ids = self._training_value(
+            training_cfg, "dflash2_target_layer_ids", "dflash_target_layer_ids", None
+        )
+        if target_layer_ids is None:
+            from verl_speco.models.dflash import build_target_layer_ids
+
+            target_layer_ids = build_target_layer_ids(
+                num_context_layers, target_num_hidden_layers
+            )
+        return DFlash2Config(
+            hidden_size=hidden_size,
+            intermediate_size=int(
+                getattr(target_text_config, "intermediate_size", hidden_size * 4)
+            ),
+            num_hidden_layers=int(
+                self._training_value(
+                    training_cfg,
+                    "dflash2_num_hidden_layers",
+                    "dflash_num_hidden_layers",
+                    5,
+                )
+            ),
+            num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
+            num_key_value_heads=int(
+                getattr(
+                    target_text_config,
+                    "num_key_value_heads",
+                    getattr(target_text_config, "num_attention_heads"),
+                )
+            ),
+            vocab_size=int(target_text_config.vocab_size),
+            rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
+            max_position_embeddings=int(
+                getattr(target_text_config, "max_position_embeddings", 32768)
+            ),
+            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            num_target_layers=target_num_hidden_layers,
+            num_context_layers=num_context_layers,
+            target_hidden_size=int(target_text_config.hidden_size),
+            target_num_hidden_layers=target_num_hidden_layers,
+            target_layer_ids=target_layer_ids,
+            mask_token_id=mask_token_id,
+            block_size=int(training_cfg.get("dflash2_block_size", 8)),
+            num_anchors=int(training_cfg.get("dflash2_num_anchors", 512)),
+            loss_decay_gamma=float(training_cfg.get("dflash2_loss_decay_gamma", 7.0)),
+            conv_kernel_size=int(training_cfg.get("dflash2_conv_kernel_size", 2)),
+            conv_group_size=int(training_cfg.get("dflash2_conv_group_size", 16)),
+            selector_rank=int(training_cfg.get("dflash2_selector_rank", 256)),
+            selector_top_k=int(training_cfg.get("dflash2_selector_top_k", 16)),
+            selector_loss_weight=float(
+                training_cfg.get("dflash2_selector_loss_weight", 1.0)
+            ),
+            architectures=["DFlash2DraftModel"],
+        )
+
+    def build_model(self):
+        target_model_path = self.config.model.path
+        spec_model_path = self.config.rollout.drafter.model_path
+        config_path = (
+            os.path.join(spec_model_path, "config.json") if spec_model_path else None
+        )
+        target_hf_config = self._get_target_hf_config()
+        normalized_state = None
+
+        if config_path and os.path.exists(config_path):
+            drafter_config = DFlash2Config.from_dflash2_pretrained(spec_model_path)
+            if spec_model_path and os.path.exists(spec_model_path):
+                log_drafter_checkpoint_step(
+                    logger, spec_model_path, action="Loading DFlash2 drafter weights"
+                )
+                normalized_state = self._normalize_draft_state_dict(
+                    self._load_draft_state_dict(spec_model_path)
+                )
+        else:
+            drafter_config = self._build_fallback_config(target_hf_config)
+
+        if not isinstance(drafter_config, DFlash2Config):
+            raise TypeError(
+                f"DFlash2 config is not a DFlash2Config: {type(drafter_config)}"
+            )
+        drafter_config = self._normalize_dflash_config(
+            drafter_config, target_hf_config, normalized_state, spec_model_path
+        )
+
+        draft_model = DFlash2DraftModel(deepcopy(drafter_config))
+        if (
+            spec_model_path
+            and os.path.exists(spec_model_path)
+            and os.path.exists(config_path)
+        ):
+            self._load_draft_checkpoint(
+                draft_model, spec_model_path, normalized_state=normalized_state
+            )
+        draft_model.load_embedding(target_model_path)
+        draft_model.freeze_embedding()
+
+        self.target_lm_head = self._build_target_lm_head(
+            target_model_path, target_hf_config
+        )
+        training_cfg = self.config.rollout.drafter.training
+        return DFlash2TrainingModel(
+            draft_model=draft_model,
+            block_size=int(
+                training_cfg.get(
+                    "dflash2_block_size", getattr(drafter_config, "block_size", 8)
+                )
+            ),
+            num_anchors=int(
+                training_cfg.get(
+                    "dflash2_num_anchors", getattr(drafter_config, "num_anchors", 512)
+                )
+            ),
+            loss_decay_gamma=float(
+                training_cfg.get(
+                    "dflash2_loss_decay_gamma",
+                    getattr(drafter_config, "loss_decay_gamma", 7.0),
+                )
+            ),
+            selector_loss_weight=float(
+                training_cfg.get(
+                    "dflash2_selector_loss_weight",
+                    getattr(drafter_config, "selector_loss_weight", 1.0),
+                )
+            ),
+        ), drafter_config
+
+
+__all__ = ["DFlash2TrainerBackend", "DFlash2TrainingModel"]

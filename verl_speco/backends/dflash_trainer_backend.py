@@ -153,6 +153,41 @@ class DFlashTrainingModel(nn.Module):
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
+    def _auxiliary_loss(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        safe_label_indices: torch.Tensor,
+        active_mask: torch.Tensor,
+        active_hidden: torch.Tensor,
+        active_logits: torch.Tensor,
+        active_targets: torch.Tensor,
+        active_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Extra loss term contributed by a DFlash variant's own head.
+
+        Called once per step with the intermediates of the main CE path, at the
+        point where they all exist. Plain DFlash has no auxiliary head and
+        returns ``None``, leaving the loss untouched.
+
+        Args:
+            input_ids: ``[bsz, seq_len]`` full sequence, for variants that need
+                neighbouring tokens (for example a predecessor token).
+            safe_label_indices: ``[bsz, n_blocks, block_size]`` clamped absolute
+                positions each block slot predicts.
+            active_mask: ``[bsz * n_blocks * block_size]`` bool mask of the rows
+                that carry loss weight.
+            active_hidden: ``[num_active, hidden]`` backbone states of those rows.
+            active_logits: ``[num_active, vocab]`` drafter logits of those rows.
+            active_targets: ``[num_active]`` ground-truth token ids.
+            active_weights: ``[num_active]`` per-row loss weights.
+
+        Returns:
+            tuple: ``(loss_or_None, metrics)`` to add to the total loss and the
+            diagnostics dict.
+        """
+        return None, {}
+
     def _cached_arange(
         self,
         name: str,
@@ -451,6 +486,20 @@ class DFlashTrainingModel(nn.Module):
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
 
+        auxiliary_metrics: dict[str, torch.Tensor] = {}
+        if active_targets.numel() > 0:
+            auxiliary_loss, auxiliary_metrics = self._auxiliary_loss(
+                input_ids=input_ids,
+                safe_label_indices=safe_label_indices,
+                active_mask=active_mask,
+                active_hidden=active_hidden,
+                active_logits=active_logits,
+                active_targets=active_targets,
+                active_weights=active_weights,
+            )
+            if auxiliary_loss is not None:
+                loss = loss + auxiliary_loss
+
         with torch.no_grad():
             correct = torch.zeros_like(binary_eval_mask, dtype=torch.bool)
             top1_correct_count = torch.zeros((), dtype=torch.float32, device=device)
@@ -605,6 +654,7 @@ class DFlashTrainingModel(nn.Module):
                     device=device,
                 ),
             }
+            diagnostics.update(auxiliary_metrics)
 
         return (
             loss,

@@ -818,13 +818,14 @@ class DrafterBaseTrainer:
     def _is_block_drafter_backend(self) -> bool:
         return getattr(self.backend, "model_type", None) in {
             "dflash",
+            "dflash2",
             "dspark",
             "domino",
         }
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino"}:
+        if model_type in {"dspark", "domino", "dflash2"}:
             return model_type
         return "dflash"
 
@@ -1030,7 +1031,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dspark", "domino"}
+            in {"eagle3", "dflash", "dflash2", "dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):

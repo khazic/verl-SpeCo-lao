@@ -18,8 +18,9 @@ from __future__ import annotations
 from typing import Any
 
 # Drafters that consume the DFlash aux context layers instead of the EAGLE
-# aux-plus-final layout. Domino is a DFlash variant, so it shares the layout.
-DFLASH_FAMILY_ALGORITHMS = frozenset({"DFLASH", "DSPARK", "DOMINO"})
+# aux-plus-final layout. Domino and DFlash2 are DFlash variants, so they share
+# the layout.
+DFLASH_FAMILY_ALGORITHMS = frozenset({"DFLASH", "DFLASH2", "DSPARK", "DOMINO"})
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -188,6 +189,7 @@ def _dflash_num_context_layers(
             _get_nested(training_cfg, ("dspark_num_target_layers",), None)
         )
     candidates.append(_get_nested(training_cfg, ("domino_num_target_layers",), None))
+    candidates.append(_get_nested(training_cfg, ("dflash2_num_target_layers",), None))
     candidates.extend(
         (
             _get_nested(training_cfg, ("dflash_num_target_layers",), None),
