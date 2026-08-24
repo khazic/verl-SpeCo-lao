@@ -69,7 +69,18 @@ class DFlash2TrainingModel(DFlashTrainingModel):
 
         device = active_hidden.device
         top_k = min(selector.top_k, active_logits.shape[-1])
-        unary, candidates = torch.topk(active_logits, top_k, dim=-1, sorted=False)
+        # Detach the backbone inputs. The selector is an auxiliary head that
+        # re-ranks whatever the drafter already produced, so its objective must
+        # not reshape the drafter itself: torch.topk passes gradient through the
+        # selected logits, and hidden_projection would otherwise push gradient
+        # back through the backbone as well. Leaving them attached also breaks
+        # any DFlash/DFlash2 comparison, because the two backbones would then be
+        # trained under different effective objectives rather than differing
+        # only by architecture.
+        unary, candidates = torch.topk(
+            active_logits.detach(), top_k, dim=-1, sorted=False
+        )
+        selector_hidden = active_hidden.detach()
 
         # Teacher-forced predecessor: the token immediately before the slot this
         # row predicts. Block-relative position 0 is the anchor and never carries
@@ -81,7 +92,7 @@ class DFlash2TrainingModel(DFlashTrainingModel):
         predecessor_ids = predecessor_ids.reshape(-1)[active_mask]
 
         scores = selector.pair_scores(
-            active_hidden, unary.float(), candidates, predecessor_ids
+            selector_hidden, unary.float(), candidates, predecessor_ids
         )
 
         # The selector can only learn on rows whose ground truth survived the
