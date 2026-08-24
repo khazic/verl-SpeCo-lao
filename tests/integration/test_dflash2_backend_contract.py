@@ -460,3 +460,46 @@ def test_dflash2_config_routes_through_auto(tmp_path) -> None:
     # The nested z-lab block must survive routing through AutoDraftModelConfig.
     assert loaded.block_size == 8
     assert loaded.selector_top_k == 16
+
+
+def test_accepted_length_stops_at_the_first_mismatch() -> None:
+    """Acceptance is a prefix property, not a sum of per-position marginals."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    import torch
+
+    from verl_speco.backends.dflash_trainer_backend import accepted_prefix_lengths
+
+    scored = torch.ones(1, 4, 7, dtype=torch.bool)
+    correct = torch.tensor(
+        [
+            [
+                [1, 1, 1, 1, 1, 1, 1],  # every position correct
+                [1, 1, 0, 1, 1, 1, 1],  # miss at 3 truncates the tail
+                [0, 1, 1, 1, 1, 1, 1],  # miss at 1 accepts nothing
+                [0, 0, 0, 0, 0, 0, 0],  # nothing correct
+            ]
+        ],
+        dtype=torch.bool,
+    )
+
+    accepted = accepted_prefix_lengths(correct, scored)
+    assert accepted.tolist() == [[7, 2, 0, 0]]
+    # The marginals would have credited the truncated blocks with far more.
+    assert correct.sum(dim=-1).tolist() == [[7, 6, 6, 0]]
+
+
+def test_accepted_length_treats_unscored_positions_as_terminal() -> None:
+    """A block that runs past its supervised region cannot keep accepting."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    import torch
+
+    from verl_speco.backends.dflash_trainer_backend import accepted_prefix_lengths
+
+    correct = torch.ones(1, 1, 7, dtype=torch.bool)
+    scored = torch.tensor([[[1, 1, 1, 0, 0, 0, 0]]], dtype=torch.bool)
+
+    assert accepted_prefix_lengths(correct, scored).tolist() == [[3]]

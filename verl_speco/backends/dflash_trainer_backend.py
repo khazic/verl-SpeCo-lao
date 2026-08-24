@@ -50,6 +50,24 @@ class _SyncedTargetHead(nn.Module):
         return self.fc(hidden_states)
 
 
+def accepted_prefix_lengths(
+    block_correct: torch.Tensor, block_scored: torch.Tensor
+) -> torch.Tensor:
+    """Leading correct draft tokens per block, stopping at the first mismatch.
+
+    A greedy verifier accepts a drafted block prefix and rejects everything from
+    the first mismatch onward, so position ``k`` only counts when ``1..k`` are
+    all correct. This is a prefix property and cannot be recovered from the
+    per-position marginal accuracies, which count each position independently.
+
+    Both arguments cover the predicted positions only (the block anchor is
+    excluded) and are shaped ``[bsz, n_blocks, block_size - 1]``. Unscored
+    positions terminate the prefix, since nothing beyond the supervised region
+    can be counted as accepted.
+    """
+    return torch.cumprod((block_correct & block_scored).int(), dim=-1).sum(dim=-1)
+
+
 def _create_dflash_mask_mod(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -624,6 +642,17 @@ class DFlashTrainingModel(nn.Module):
             )
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
+            # Mean number of leading draft tokens a greedy verifier would accept
+            # per block. A verifier stops at the first mismatch, so acceptance is
+            # a prefix property: position k only counts if 1..k are all correct.
+            # The per-position accuracies above are marginals and cannot be
+            # combined into this, which is why it is tracked separately.
+            block_correct = correct.view(bsz, n_blocks, self.block_size)[:, :, 1:]
+            block_scored = binary_weights[:, :, 1:] > 0
+            accepted_per_block = accepted_prefix_lengths(block_correct, block_scored)
+            scored_blocks = block_scored.any(dim=-1)
+            accepted_length_sum = (accepted_per_block * scored_blocks).sum().float()
+            accepted_block_count = scored_blocks.sum().float()
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
             diagnostics = {
                 "correct_count": correct.sum().float(),
@@ -638,6 +667,8 @@ class DFlashTrainingModel(nn.Module):
                 "loss_sum_per_position": loss_sum_per_position,
                 "correct_per_position": correct_per_position,
                 "count_per_position": count_per_position,
+                "accepted_length_sum": accepted_length_sum,
+                "accepted_block_count": accepted_block_count,
                 "sampled_vocab_size": torch.tensor(
                     float(restricted_vocab.numel())
                     if self.loss_mode in {"restricted_ce", "sampled_ce"}
