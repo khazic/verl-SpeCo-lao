@@ -38,7 +38,15 @@ def _batch(store, key, device, num_context_layers):
     }
 
 
-def _build(algorithm, target_path, target_cfg, block_size, num_context_layers, lr):
+def _build(
+    algorithm,
+    target_path,
+    target_cfg,
+    block_size,
+    num_context_layers,
+    lr,
+    selector_weight=None,
+):
     prefix = algorithm.lower()
     training = {
         f"{prefix}_block_size": block_size,
@@ -47,6 +55,8 @@ def _build(algorithm, target_path, target_cfg, block_size, num_context_layers, l
         f"{prefix}_num_hidden_layers": 1,
         "lr": lr,
     }
+    if selector_weight is not None:
+        training[f"{prefix}_selector_loss_weight"] = float(selector_weight)
     cfg = OmegaConf.create(
         {
             "rollout": {
@@ -113,6 +123,11 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-samples", type=int, default=128)
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--arms",
+        default="DFLASH,DFLASH2",
+        help='Comma list; an entry may be "ALGO" or "ALGO:selector_weight"',
+    )
     args = parser.parse_args()
 
     from transformers import AutoConfig
@@ -127,8 +142,17 @@ def main() -> None:
         flush=True,
     )
 
+    # Arms are "ALGORITHM" or "ALGORITHM:selector_weight". The zero-weight
+    # DFlash2 arm isolates the convolution: the selector head is then never
+    # trained, so it also cannot inflate the global gradient-clipping norm and
+    # shrink the backbone's effective step, which is the one indirect path by
+    # which the selector could otherwise affect the drafter.
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+
     report = {}
-    for algorithm in ("DFLASH", "DFLASH2"):
+    for arm in arms:
+        algorithm, _, weight = arm.partition(":")
+        selector_weight = float(weight) if weight else None
         torch.manual_seed(0)
         backend, model, optimizer, drafter_cfg = _build(
             algorithm,
@@ -137,9 +161,10 @@ def main() -> None:
             args.block_size,
             args.num_context_layers,
             args.lr,
+            selector_weight=selector_weight,
         )
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"[ab] {algorithm} trainable_params={n_params:,}", flush=True)
+        print(f"[ab] {arm} trainable_params={n_params:,}", flush=True)
 
         history = []
         order = list(train_keys)
@@ -175,24 +200,29 @@ def main() -> None:
                         f"  lift={evaluation['selector_lift']:+.4f}"
                     )
                 print(
-                    f"[ab] {algorithm} step {step + 1:4d}  train_loss={float(loss):.4f}"
+                    f"[ab] {arm} step {step + 1:4d}  train_loss={float(loss):.4f}"
                     f"  heldout_acc={evaluation['overall_acc']:.4f}{extra}",
                     flush=True,
                 )
-        report[algorithm] = history
+        report[arm] = history
         del backend, model, optimizer
         torch.cuda.empty_cache()
 
     final = {a: h[-1] for a, h in report.items()}
     print("\n[ab] ===== HELD-OUT SUMMARY =====", flush=True)
-    for algorithm, evaluation in final.items():
+    for arm_name, evaluation in final.items():
         print(
-            f"[ab] {algorithm:8s} overall={evaluation['overall_acc']:.4f}  "
+            f"[ab] {arm_name:14s} overall={evaluation['overall_acc']:.4f}  "
             f"per_position={[round(v, 4) for v in evaluation['per_position_acc'][1:]]}",
             flush=True,
         )
-    delta = final["DFLASH2"]["overall_acc"] - final["DFLASH"]["overall_acc"]
-    print(f"[ab] DFlash2 - DFlash held-out accuracy delta = {delta:+.4f}", flush=True)
+    base = final.get("DFLASH")
+    if base is not None:
+        for arm_name, evaluation in final.items():
+            if arm_name == "DFLASH":
+                continue
+            delta = evaluation["overall_acc"] - base["overall_acc"]
+            print(f"[ab] {arm_name} - DFLASH delta = {delta:+.4f}", flush=True)
     if args.out:
         with open(args.out, "w") as handle:
             json.dump(report, handle, indent=2)
