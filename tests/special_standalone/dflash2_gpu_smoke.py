@@ -140,11 +140,13 @@ def main() -> None:
 
     backend = DFlash2TrainerBackend(cfg, target_cfg)
     model, drafter_cfg = backend.build_model()
-    # Match the real training path (base_trainer): fp32 parameters driven under
-    # bf16 autocast, rather than hard-casting the module to bf16. Autocast keeps
-    # cross_entropy in fp32, which is what the shared DFlash forward expects.
-    model = model.to(device).train()
-    backend.target_lm_head = backend.target_lm_head.to(device)
+    # Match the real training path, which stacks two things: FSDP
+    # MixedPrecision(param_dtype=bf16) gives the forward bf16 parameters (so the
+    # RMSNorm weights stay bf16 and attention q/k/v agree), and the surrounding
+    # torch.amp.autocast keeps cross_entropy in fp32 (so its result can be
+    # scattered into the fp32 loss_per_token buffer). Emulate both here.
+    model = model.to(device).to(torch.bfloat16).train()
+    backend.target_lm_head = backend.target_lm_head.to(device).to(torch.bfloat16)
     optimizer = backend.setup_optimizer(model, cfg.rollout.drafter.training)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     conv = model.draft_model.layers[0].attention_conv
