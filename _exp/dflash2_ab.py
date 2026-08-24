@@ -87,6 +87,7 @@ def _evaluate(backend, model, store, keys, device, num_context_layers, block_siz
     correct = torch.zeros(block_size, dtype=torch.float64)
     counts = torch.zeros(block_size, dtype=torch.float64)
     sel_correct = sel_base = sel_tokens = 0.0
+    accepted_sum = accepted_blocks = 0.0
     for key in keys:
         batch = _batch(store, key, device, num_context_layers)
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -94,6 +95,8 @@ def _evaluate(backend, model, store, keys, device, num_context_layers, block_siz
         d = out["diagnostics"]
         correct += d["correct_per_position"].detach().double().cpu()
         counts += d["count_per_position"].detach().double().cpu()
+        accepted_sum += float(d["accepted_length_sum"])
+        accepted_blocks += float(d["accepted_block_count"])
         if "selector_correct_count" in d:
             sel_correct += float(d["selector_correct_count"])
             sel_base += float(d["selector_base_correct_count"])
@@ -104,6 +107,11 @@ def _evaluate(backend, model, store, keys, device, num_context_layers, block_siz
     scored = counts[1:].sum().item()
     overall = (correct[1:].sum() / max(scored, 1)).item()
     result = {"overall_acc": overall, "per_position_acc": per_pos, "tokens": scored}
+    # The metric that actually governs speculative speedup: a verifier stops at
+    # the first mismatch, so this is a prefix quantity and is strictly lower
+    # than what the per-position marginals above would suggest.
+    result["accepted_length"] = accepted_sum / max(accepted_blocks, 1.0)
+    result["accepted_blocks"] = accepted_blocks
     if sel_tokens > 0:
         result["selector_acc"] = sel_correct / sel_tokens
         result["unary_only_acc"] = sel_base / sel_tokens
@@ -201,7 +209,8 @@ def main() -> None:
                     )
                 print(
                     f"[ab] {arm} step {step + 1:4d}  train_loss={float(loss):.4f}"
-                    f"  heldout_acc={evaluation['overall_acc']:.4f}{extra}",
+                    f"  heldout_acc={evaluation['overall_acc']:.4f}"
+                    f"  accepted_len={evaluation['accepted_length']:.4f}{extra}",
                     flush=True,
                 )
         report[arm] = history
@@ -213,6 +222,7 @@ def main() -> None:
     for arm_name, evaluation in final.items():
         print(
             f"[ab] {arm_name:14s} overall={evaluation['overall_acc']:.4f}  "
+            f"accepted_len={evaluation['accepted_length']:.4f}  "
             f"per_position={[round(v, 4) for v in evaluation['per_position_acc'][1:]]}",
             flush=True,
         )
@@ -222,7 +232,14 @@ def main() -> None:
             if arm_name == "DFLASH":
                 continue
             delta = evaluation["overall_acc"] - base["overall_acc"]
-            print(f"[ab] {arm_name} - DFLASH delta = {delta:+.4f}", flush=True)
+            accepted_delta = (
+                evaluation["accepted_length"] - base["accepted_length"]
+            )
+            print(
+                f"[ab] {arm_name} - DFLASH  acc_delta={delta:+.4f}  "
+                f"accepted_len_delta={accepted_delta:+.4f}",
+                flush=True,
+            )
     if args.out:
         with open(args.out, "w") as handle:
             json.dump(report, handle, indent=2)
