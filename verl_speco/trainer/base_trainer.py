@@ -853,6 +853,13 @@ class DrafterBaseTrainer:
         eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
             metrics[f"{prefix}/accuracy"] = correct / eval_tokens
+        accepted_blocks = sums.get(f"{prefix}/accepted_block_count", 0.0)
+        if accepted_blocks > 0:
+            # Leading draft tokens a greedy verifier accepts per block, excluding
+            # the anchor. Add 1 for the conventional acceptance length tau.
+            metrics[f"{prefix}/accepted_length"] = (
+                sums.get(f"{prefix}/accepted_length_sum", 0.0) / accepted_blocks
+            )
         quality_tokens = sums.get(f"{prefix}/quality_token_count", 0.0)
         if quality_tokens > 0:
             metrics[f"{prefix}/top1_acc"] = (
@@ -939,6 +946,8 @@ class DrafterBaseTrainer:
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
             "eval_token_count": f"{prefix}/eval_token_count",
+            "accepted_length_sum": f"{prefix}/accepted_length_sum",
+            "accepted_block_count": f"{prefix}/accepted_block_count",
             "top1_correct_count": f"{prefix}/top1_correct_count",
             "top5_correct_count": f"{prefix}/top5_correct_count",
             "quality_token_count": f"{prefix}/quality_token_count",
