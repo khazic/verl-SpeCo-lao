@@ -259,6 +259,67 @@ def test_dflash2_training_model_adds_selector_loss() -> None:
     )
 
 
+def test_selector_loss_does_not_backprop_into_the_backbone() -> None:
+    """The selector must train as a re-ranking head, not reshape the drafter.
+
+    torch.topk passes gradient through the selected logits and the selector's
+    hidden projection reads the backbone state, so without detaching, the
+    selector's cross-entropy would flow back into the draft model. That would
+    both change the drafter's effective objective and make any DFlash/DFlash2
+    comparison confounded, since the two backbones would no longer differ only
+    by architecture.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainingModel
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_dflash2_config()
+    model = DFlash2TrainingModel(
+        draft_model=DFlash2DraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        selector_loss_weight=1.0,
+    )
+
+    n_rows = 12
+    active_hidden = torch.randn(n_rows, config.hidden_size, requires_grad=True)
+    active_logits = torch.randn(n_rows, config.vocab_size, requires_grad=True)
+    bsz, n_blocks = 1, 3
+    safe_label_indices = torch.arange(
+        1, 1 + n_blocks * config.block_size
+    ).reshape(bsz, n_blocks, config.block_size)
+    active_mask = torch.zeros(
+        bsz * n_blocks * config.block_size, dtype=torch.bool
+    )
+    active_mask[:n_rows] = True
+
+    loss, _ = model._auxiliary_loss(
+        input_ids=torch.randint(
+            0, config.vocab_size, (bsz, n_blocks * config.block_size + 1)
+        ),
+        safe_label_indices=safe_label_indices,
+        active_mask=active_mask,
+        active_hidden=active_hidden,
+        active_logits=active_logits,
+        active_targets=torch.randint(0, config.vocab_size, (n_rows,)),
+        active_weights=torch.ones(n_rows),
+    )
+    loss.backward()
+
+    assert active_hidden.grad is None, (
+        "selector loss leaked gradient into the backbone hidden states"
+    )
+    assert active_logits.grad is None, (
+        "selector loss leaked gradient into the drafter logits via topk"
+    )
+    # The selector's own parameters must still be trained.
+    assert model.draft_model.candidate_selector.hidden_projection.weight.grad is not None
+
+
 def test_dflash2_training_model_rejects_restricted_vocab() -> None:
     """Selector candidates are real token ids, so a restricted vocab is invalid."""
     pytest.importorskip("torch")
