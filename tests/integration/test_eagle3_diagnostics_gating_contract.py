@@ -74,35 +74,49 @@ def _backend_and_inputs():
     return backend, _FakeDraft(), batch
 
 
-def test_quality_diagnostics_are_silent_above_debug(caplog) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("transformers")
+class _Recorder(logging.Handler):
+    """Records everything the backend logger emits, whatever its level is.
 
+    ``caplog.at_level`` would raise the logger to DEBUG, which is exactly the
+    condition under test, so the handler is attached directly instead.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _compute_loss_at(level: int) -> list[logging.LogRecord]:
     backend, model, batch = _backend_and_inputs()
-    logging.getLogger(BACKEND_LOGGER).setLevel(logging.INFO)
-
-    with caplog.at_level(logging.DEBUG, logger=BACKEND_LOGGER):
-        backend.compute_loss(model, batch, 0)
-
-    assert not [r for r in caplog.records if QUALITY_LOG_PREFIX in r.getMessage()]
-
-
-def test_quality_diagnostics_are_emitted_at_debug(caplog) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("transformers")
-
-    backend, model, batch = _backend_and_inputs()
-    logging.getLogger(BACKEND_LOGGER).setLevel(logging.DEBUG)
-
+    backend_logger = logging.getLogger(BACKEND_LOGGER)
+    previous_level = backend_logger.level
+    recorder = _Recorder()
+    backend_logger.setLevel(level)
+    backend_logger.addHandler(recorder)
     try:
-        with caplog.at_level(logging.DEBUG, logger=BACKEND_LOGGER):
-            backend.compute_loss(model, batch, 0)
+        backend.compute_loss(model, batch, 0)
     finally:
-        logging.getLogger(BACKEND_LOGGER).setLevel(logging.INFO)
+        backend_logger.removeHandler(recorder)
+        backend_logger.setLevel(previous_level)
+    return [r for r in recorder.records if QUALITY_LOG_PREFIX in r.getMessage()]
 
-    quality_records = [
-        r for r in caplog.records if QUALITY_LOG_PREFIX in r.getMessage()
-    ]
+
+def test_quality_diagnostics_are_silent_above_debug() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    assert _compute_loss_at(logging.INFO) == []
+
+
+def test_quality_diagnostics_are_emitted_at_debug() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    quality_records = _compute_loss_at(logging.DEBUG)
+
     assert quality_records
     # Routine per-step training metrics belong at DEBUG, not WARNING.
     assert all(r.levelno == logging.DEBUG for r in quality_records)
@@ -117,7 +131,9 @@ def test_quality_diagnostics_do_not_sync_above_debug() -> None:
 
     def run_at(level: int) -> int:
         backend, model, batch = _backend_and_inputs()
-        logging.getLogger(BACKEND_LOGGER).setLevel(level)
+        backend_logger = logging.getLogger(BACKEND_LOGGER)
+        previous_level = backend_logger.level
+        backend_logger.setLevel(level)
         calls = 0
 
         def counting_item(self):
@@ -130,7 +146,7 @@ def test_quality_diagnostics_do_not_sync_above_debug() -> None:
             backend.compute_loss(model, batch, 0)
         finally:
             torch.Tensor.item = original_item
-            logging.getLogger(BACKEND_LOGGER).setLevel(logging.INFO)
+            backend_logger.setLevel(previous_level)
         return calls
 
     assert run_at(logging.INFO) < run_at(logging.DEBUG)
