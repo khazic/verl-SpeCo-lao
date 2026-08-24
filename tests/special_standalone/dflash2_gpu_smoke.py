@@ -140,8 +140,11 @@ def main() -> None:
 
     backend = DFlash2TrainerBackend(cfg, target_cfg)
     model, drafter_cfg = backend.build_model()
-    model = model.to(device).to(torch.bfloat16).train()
-    backend.target_lm_head = backend.target_lm_head.to(device).to(torch.bfloat16)
+    # Match the real training path (base_trainer): fp32 parameters driven under
+    # bf16 autocast, rather than hard-casting the module to bf16. Autocast keeps
+    # cross_entropy in fp32, which is what the shared DFlash forward expects.
+    model = model.to(device).train()
+    backend.target_lm_head = backend.target_lm_head.to(device)
     optimizer = backend.setup_optimizer(model, cfg.rollout.drafter.training)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     conv = model.draft_model.layers[0].attention_conv
@@ -153,7 +156,8 @@ def main() -> None:
 
     first = None
     for step in range(args.steps):
-        out = backend.compute_loss(model, batch, 0)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = backend.compute_loss(model, batch, 0)
         num_tokens = out["local_num_tokens"].clamp_min(1)
         loss = out["total_local_ploss"] / num_tokens
         optimizer.zero_grad()
