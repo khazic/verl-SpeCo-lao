@@ -154,9 +154,7 @@ def test_conv_does_not_leak_across_block_boundaries() -> None:
 
     # First row of each block has no in-block predecessor, so it must be zero.
     torch.testing.assert_close(out[:, 0], torch.zeros_like(out[:, 0]))
-    torch.testing.assert_close(
-        out[:, block_size], torch.zeros_like(out[:, block_size])
-    )
+    torch.testing.assert_close(out[:, block_size], torch.zeros_like(out[:, block_size]))
     # Interior rows read their own block's previous row.
     torch.testing.assert_close(out[:, 1], hidden[:, 0])
     torch.testing.assert_close(out[:, block_size + 1], hidden[:, block_size])
@@ -289,12 +287,10 @@ def test_selector_loss_does_not_backprop_into_the_backbone() -> None:
     active_hidden = torch.randn(n_rows, config.hidden_size, requires_grad=True)
     active_logits = torch.randn(n_rows, config.vocab_size, requires_grad=True)
     bsz, n_blocks = 1, 3
-    safe_label_indices = torch.arange(
-        1, 1 + n_blocks * config.block_size
-    ).reshape(bsz, n_blocks, config.block_size)
-    active_mask = torch.zeros(
-        bsz * n_blocks * config.block_size, dtype=torch.bool
+    safe_label_indices = torch.arange(1, 1 + n_blocks * config.block_size).reshape(
+        bsz, n_blocks, config.block_size
     )
+    active_mask = torch.zeros(bsz * n_blocks * config.block_size, dtype=torch.bool)
     active_mask[:n_rows] = True
 
     loss, _ = model._auxiliary_loss(
@@ -317,7 +313,9 @@ def test_selector_loss_does_not_backprop_into_the_backbone() -> None:
         "selector loss leaked gradient into the drafter logits via topk"
     )
     # The selector's own parameters must still be trained.
-    assert model.draft_model.candidate_selector.hidden_projection.weight.grad is not None
+    assert (
+        model.draft_model.candidate_selector.hidden_projection.weight.grad is not None
+    )
 
 
 def test_dflash2_training_model_rejects_restricted_vocab() -> None:
@@ -460,3 +458,120 @@ def test_dflash2_config_routes_through_auto(tmp_path) -> None:
     # The nested z-lab block must survive routing through AutoDraftModelConfig.
     assert loaded.block_size == 8
     assert loaded.selector_top_k == 16
+
+
+def test_acceptance_counts_stop_at_the_first_mismatch() -> None:
+    """Acceptance is a prefix property, not a sum of per-position marginals."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    import torch
+
+    from verl_speco.backends.dflash_trainer_backend import _block_acceptance_counts
+
+    # Drafted positions only; the caller has already dropped any anchor column.
+    correct = torch.tensor(
+        [
+            [
+                [1, 1, 1, 1, 1, 1, 1],  # every drafted position correct
+                [1, 1, 0, 1, 1, 1, 1],  # miss at index 2 truncates the tail
+                [0, 1, 1, 1, 1, 1, 1],  # miss at index 0 accepts nothing
+                [0, 0, 0, 0, 0, 0, 0],  # nothing correct
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    scored = torch.ones(1, 4, 7, dtype=torch.bool)
+
+    accepted_sum, scored_blocks = _block_acceptance_counts(correct, scored)
+    # 7 + 2 + 0 + 0, over 4 scored blocks.
+    assert float(accepted_sum) == 9.0
+    assert float(scored_blocks) == 4.0
+    # The marginals would have credited the truncated blocks with 6 apiece.
+    assert correct.sum(dim=-1).tolist() == [[7, 6, 6, 0]]
+
+
+def test_acceptance_counts_treat_unscored_positions_as_terminal() -> None:
+    """A block that runs past its supervised region cannot keep accepting."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    import torch
+
+    from verl_speco.backends.dflash_trainer_backend import _block_acceptance_counts
+
+    correct = torch.ones(1, 2, 7, dtype=torch.bool)
+    scored = torch.tensor(
+        [
+            [
+                [1, 1, 1, 0, 0, 0, 0],  # supervised through index 2
+                [0, 0, 0, 0, 0, 0, 0],  # nothing to score
+            ]
+        ],
+        dtype=torch.bool,
+    )
+
+    accepted_sum, scored_blocks = _block_acceptance_counts(correct, scored)
+    assert float(accepted_sum) == 3.0
+    # A block with nothing to score must not dilute the mean.
+    assert float(scored_blocks) == 1.0
+
+
+def test_acceptance_counts_do_not_assume_an_anchor_column() -> None:
+    """Shifted-label drafters have no anchor, so position 0 must be able to truncate.
+
+    DFlash keeps an unscored anchor at column 0 and slices it off before calling.
+    Domino and DSpark build labels with a ``+ 1`` offset, so their column 0 is a
+    real prediction. If this helper sliced internally it would both discard that
+    token and let a wrong first token pass unnoticed, over-reporting acceptance
+    on exactly the case the metric exists to catch.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    import torch
+
+    from verl_speco.backends.dflash_trainer_backend import _block_acceptance_counts
+
+    # Wrong at position 0, right everywhere after: a verifier accepts nothing.
+    correct = torch.tensor([[[0, 1, 1, 1, 1, 1, 1, 1]]], dtype=torch.bool)
+    scored = torch.ones(1, 1, 8, dtype=torch.bool)
+
+    accepted_sum, scored_blocks = _block_acceptance_counts(correct, scored)
+    assert float(accepted_sum) == 0.0
+    assert float(scored_blocks) == 1.0
+
+    # And an all-correct block of the same layout yields every position.
+    accepted_sum, _ = _block_acceptance_counts(
+        torch.ones(1, 1, 8, dtype=torch.bool), scored
+    )
+    assert float(accepted_sum) == 8.0
+
+
+def test_mean_acceptance_length_counts_the_target_bonus_token() -> None:
+    """The reported metric adds the target's own token, matching the rollout metric."""
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dflash2")
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(drafter=SimpleNamespace(training={}))
+    )
+    trainer._training_metric_steps = 1
+    trainer._training_metric_sums = {
+        "dflash2/accepted_length_sum": 9.0,
+        "dflash2/scored_block_count": 4.0,
+    }
+    trainer.optimizer = None
+    trainer.optimizer_steps_total = 0
+
+    metrics = trainer.get_training_metrics()
+
+    # 9 / 4 accepted drafts, plus the token the target emits itself.
+    assert metrics["dflash2/mean_acceptance_length"] == pytest.approx(3.25)
+    # The raw sum and count are published too, so the ratio can be debugged.
+    assert metrics["dflash2/accepted_length_sum"] == pytest.approx(9.0)
+    assert metrics["dflash2/scored_block_count"] == pytest.approx(4.0)

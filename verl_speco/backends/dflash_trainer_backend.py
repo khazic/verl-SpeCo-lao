@@ -50,6 +50,38 @@ class _SyncedTargetHead(nn.Module):
         return self.fc(hidden_states)
 
 
+def _block_acceptance_counts(
+    block_correct: torch.Tensor, block_scored: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accepted draft tokens summed over blocks, and the number of scored blocks.
+
+    A greedy verifier takes a drafted block prefix and rejects everything from
+    the first mismatch onward, so position ``k`` only counts when ``0..k`` are
+    all correct. That is a prefix property, and it cannot be recovered from the
+    per-position marginal accuracies, which count each position independently.
+
+    Both arguments cover the **drafted** positions only, shaped
+    ``[bsz, n_blocks, n_drafted]``. Callers own that slicing because the block
+    layouts differ: DFlash keeps an unscored anchor at column 0 and must drop
+    it, while Domino and DSpark build shifted labels where every column is a
+    real prediction. Slicing inside here would silently discard their first
+    drafted token and, worse, stop a wrong first token from truncating the
+    block, which is the exact failure the metric exists to catch.
+
+    ``block_scored`` must be the same mask the correctness was computed under,
+    so that an unscored position reads as "no more prefix" rather than as a
+    mismatch. Unscored positions terminate the prefix, because nothing beyond
+    the supervised region can be counted as accepted.
+
+    Returned as a sum and a count rather than a mean so the two reduce correctly
+    across microbatches and across ranks. ``cumsum`` rather than ``cumprod``
+    because it is the more broadly supported primitive across backends.
+    """
+    broken = (~(block_correct & block_scored)).cumsum(dim=-1)
+    accepted = (broken == 0).sum(dim=-1)
+    return accepted.sum().float(), block_scored.any(dim=-1).sum().float()
+
+
 def _create_dflash_mask_mod(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -624,6 +656,21 @@ class DFlashTrainingModel(nn.Module):
             )
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
+            # Prefix acceptance per block; the per-position accuracies above are
+            # marginals and cannot be combined into it. Column 0 is this layout's
+            # anchor, so it is dropped. The scoring mask is intersected with the
+            # reweighted mask because `correct` was only written where
+            # `active_mask` held: a position zeroed by loss decay or by
+            # `front_position_weight` is unscored, not a mismatch, and reading it
+            # as a mismatch would truncate every block's prefix.
+            block_drafted = slice(1, None)
+            block_scored = (binary_weights > 0) & (
+                flat_weights.view(bsz, n_blocks, self.block_size) > 0
+            )
+            accepted_length_sum, scored_block_count = _block_acceptance_counts(
+                correct.view(bsz, n_blocks, self.block_size)[:, :, block_drafted],
+                block_scored[:, :, block_drafted],
+            )
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
             diagnostics = {
                 "correct_count": correct.sum().float(),
@@ -638,6 +685,8 @@ class DFlashTrainingModel(nn.Module):
                 "loss_sum_per_position": loss_sum_per_position,
                 "correct_per_position": correct_per_position,
                 "count_per_position": count_per_position,
+                "accepted_length_sum": accepted_length_sum,
+                "scored_block_count": scored_block_count,
                 "sampled_vocab_size": torch.tensor(
                     float(restricted_vocab.numel())
                     if self.loss_mode in {"restricted_ce", "sampled_ce"}

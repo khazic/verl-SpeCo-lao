@@ -853,6 +853,16 @@ class DrafterBaseTrainer:
         eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
             metrics[f"{prefix}/accuracy"] = correct / eval_tokens
+        scored_blocks = sums.get(f"{prefix}/scored_block_count", 0.0)
+        if scored_blocks > 0:
+            # Same convention as the rollout-side drafter/spec_decode/
+            # mean_acceptance_length: the leading 1.0 is the token the target
+            # emits itself at each verification step, not a drafted one, so the
+            # training metric predicts the served one instead of sitting a token
+            # below it on the same dashboard.
+            metrics[f"{prefix}/mean_acceptance_length"] = 1.0 + (
+                sums.get(f"{prefix}/accepted_length_sum", 0.0) / scored_blocks
+            )
         quality_tokens = sums.get(f"{prefix}/quality_token_count", 0.0)
         if quality_tokens > 0:
             metrics[f"{prefix}/top1_acc"] = (
@@ -877,6 +887,8 @@ class DrafterBaseTrainer:
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
             f"{prefix}/quality_token_count",
+            f"{prefix}/accepted_length_sum",
+            f"{prefix}/scored_block_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
             f"{prefix}/sampled_vocab_size",
@@ -939,6 +951,8 @@ class DrafterBaseTrainer:
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
             "eval_token_count": f"{prefix}/eval_token_count",
+            "accepted_length_sum": f"{prefix}/accepted_length_sum",
+            "scored_block_count": f"{prefix}/scored_block_count",
             "top1_correct_count": f"{prefix}/top1_correct_count",
             "top5_correct_count": f"{prefix}/top5_correct_count",
             "quality_token_count": f"{prefix}/quality_token_count",
