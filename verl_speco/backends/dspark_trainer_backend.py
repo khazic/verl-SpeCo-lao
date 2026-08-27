@@ -28,6 +28,7 @@ from verl_speco.backends.dflash_trainer_backend import (
     _create_dflash_dense_attention_mask,
     _create_dflash_mask_mod,
 )
+from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -775,7 +776,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            rope_theta=resolve_rope_theta(target_text_config),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
