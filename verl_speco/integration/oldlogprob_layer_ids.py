@@ -102,6 +102,8 @@ def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
         architecture
         in {
             "DFlashDraftModel",
+            "DFlash2DraftModel",
+            "Qwen3DFlash2Model",
             "DSparkDraftModel",
             "Qwen3DSparkModel",
             "DominoDraftModel",

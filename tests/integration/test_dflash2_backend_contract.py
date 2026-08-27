@@ -575,3 +575,303 @@ def test_mean_acceptance_length_counts_the_target_bonus_token() -> None:
     # The raw sum and count are published too, so the ratio can be debugged.
     assert metrics["dflash2/accepted_length_sum"] == pytest.approx(9.0)
     assert metrics["dflash2/scored_block_count"] == pytest.approx(4.0)
+
+
+def _dflash2_backend(**training_overrides):
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
+
+    training = {"dflash2_block_size": 4}
+    training.update(training_overrides)
+    return DFlash2TrainerBackend(
+        OmegaConf.create(
+            {
+                "rollout": {
+                    "drafter": {
+                        "speculative_algorithm": "DFLASH2",
+                        "model_path": "",
+                        "training": training,
+                    }
+                },
+                "model": {"path": ""},
+            }
+        ),
+        None,
+    )
+
+
+def test_config_reads_rope_theta_from_rope_parameters(tmp_path) -> None:
+    """The released checkpoint carries the RoPE base only under rope_parameters.
+
+    transformers 5 moved it there, so reading ``rope_theta`` alone falls back to
+    the 10000.0 default: three orders of magnitude below the 1e7 the checkpoint
+    was trained at, and silent, because nothing downstream can tell a defaulted
+    base from a real one.
+    """
+    pytest.importorskip("transformers")
+    import json
+
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlash2DraftModel"],
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 32,
+                "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+                "dflash_config": {"block_size": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = DFlash2Config.from_dflash2_pretrained(str(tmp_path))
+    assert config.rope_theta == pytest.approx(1e7)
+
+
+def test_top_level_rope_theta_wins_over_rope_parameters() -> None:
+    """A config this overlay wrote itself must round-trip unchanged."""
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash import DFlashConfig
+
+    config = DFlashConfig(
+        rope_theta=500000.0,
+        rope_parameters={"rope_theta": 10000000, "rope_type": "default"},
+    )
+    assert config.rope_theta == pytest.approx(500000.0)
+
+
+def test_rope_theta_defaults_when_neither_spelling_is_present() -> None:
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash import DEFAULT_ROPE_THETA, DFlashConfig
+
+    assert DFlashConfig().rope_theta == pytest.approx(DEFAULT_ROPE_THETA)
+
+
+def test_resolve_rope_theta_reads_config_objects_and_mappings() -> None:
+    from types import SimpleNamespace
+
+    from verl_speco.models.dflash import resolve_rope_theta
+
+    assert resolve_rope_theta({"rope_parameters": {"rope_theta": 7.0}}) == 7.0
+    assert (
+        resolve_rope_theta(
+            SimpleNamespace(rope_parameters=SimpleNamespace(rope_theta=7.0))
+        )
+        == 7.0
+    )
+    assert resolve_rope_theta(None, default=3.0) == 3.0
+    # An empty/unset rope_parameters must not shadow the default.
+    assert resolve_rope_theta({"rope_parameters": None}, default=3.0) == 3.0
+
+
+def test_fallback_config_reads_the_target_rope_parameters() -> None:
+    """Cold start hits the same split: modern target configs nest the base too.
+
+    Without this the draft's RoPE base silently disagrees with the target it is
+    drafting for, and every DFlash-family arm of an A/B would sit at 10000.0
+    regardless of the target.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from types import SimpleNamespace
+
+    target_config = SimpleNamespace(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=4,
+        vocab_size=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=64,
+        rope_parameters={"rope_theta": 10000000, "rope_type": "default"},
+    )
+
+    config = _dflash2_backend()._build_fallback_config(target_config)
+    assert config.rope_theta == pytest.approx(1e7)
+
+
+def _upstream_spelling(state_dict):
+    """Rewrite a model state dict into the upstream z-lab key spelling."""
+    renamed = {}
+    for key, value in state_dict.items():
+        if key.endswith("_codebook.weight"):
+            key = key[: -len(".weight")]
+        renamed[key] = value
+    return renamed
+
+
+def test_upstream_selector_codebooks_load_onto_the_embedding_keys() -> None:
+    """Upstream stores the codebooks as bare Parameters, this overlay as Embeddings.
+
+    ``_load_draft_checkpoint`` drops keys the model does not have with only a
+    debug log, and its required-key gate covers the DFlash backbone only, so
+    without the rename the two codebooks stay randomly initialized and nothing
+    says so.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    reference = DFlash2DraftModel(_tiny_dflash2_config())
+    with torch.no_grad():
+        reference.candidate_selector.predecessor_codebook.weight.normal_()
+        reference.candidate_selector.successor_codebook.weight.normal_()
+        for layer in reference.layers:
+            layer.attention_conv.base_kernel.normal_()
+
+    backend = _dflash2_backend()
+    normalized = backend._normalize_draft_state_dict(
+        _upstream_spelling(reference.state_dict())
+    )
+    assert "candidate_selector.predecessor_codebook.weight" in normalized
+    assert "candidate_selector.predecessor_codebook" not in normalized
+
+    loaded = DFlash2DraftModel(_tiny_dflash2_config())
+    backend._load_draft_checkpoint(loaded, "<test>", normalized_state=normalized)
+
+    torch.testing.assert_close(
+        loaded.candidate_selector.predecessor_codebook.weight,
+        reference.candidate_selector.predecessor_codebook.weight,
+    )
+    torch.testing.assert_close(
+        loaded.candidate_selector.successor_codebook.weight,
+        reference.candidate_selector.successor_codebook.weight,
+    )
+    torch.testing.assert_close(
+        loaded.layers[0].attention_conv.base_kernel,
+        reference.layers[0].attention_conv.base_kernel,
+    )
+
+
+def test_partially_renamed_dflash2_modules_fail_loud() -> None:
+    """A future upstream rename must not degrade into a silent cold start."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    model = DFlash2DraftModel(_tiny_dflash2_config())
+    state = dict(model.state_dict())
+    state["candidate_selector.prev_codebook"] = state.pop(
+        "candidate_selector.predecessor_codebook.weight"
+    )
+
+    backend = _dflash2_backend()
+    with pytest.raises(ValueError, match="only part of the DFlash2 modules"):
+        backend._load_draft_checkpoint(model, "<test>", normalized_state=state)
+
+
+def test_plain_dflash_checkpoint_warm_starts_without_the_dflash2_modules() -> None:
+    """Warm-starting DFlash2 from a DFlash backbone stays a legitimate flow.
+
+    The DFlash2 modules cold-start as an identity passthrough by design, so a
+    checkpoint carrying none of them is a deliberate configuration, not a
+    mismatch.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash2 import DFlash2DraftModel
+
+    model = DFlash2DraftModel(_tiny_dflash2_config())
+    backbone_only = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not any(
+            marker in key
+            for marker in ("attention_conv.", "mlp_conv.", "candidate_selector.")
+        )
+    }
+
+    backend = _dflash2_backend()
+    backend._load_draft_checkpoint(model, "<test>", normalized_state=backbone_only)
+
+
+def test_dflash2_rejected_by_vllm_config_builder() -> None:
+    from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
+
+    with pytest.raises(ValueError, match="not an engine-level speculative algorithm"):
+        _speculative_method_from_drafter({"speculative_algorithm": "DFLASH2"})
+
+
+def test_dflash2_rejected_by_sglang_config_builder() -> None:
+    from verl_speco.integration.sglang_runtime import (
+        _server_args_overrides_from_drafter,
+    )
+
+    with pytest.raises(ValueError, match="not an engine-level speculative algorithm"):
+        _server_args_overrides_from_drafter(
+            {"enable": True, "speculative_algorithm": "DFLASH2"},
+            supported_fields={"speculative_algorithm"},
+        )
+
+
+def test_dflash2_never_reaches_the_sglang_aux_hidden_path() -> None:
+    """The engine rejects DFLASH2 under the same ``enable`` this helper requires."""
+    from verl_speco.integration.sglang_runtime import _drafter_uses_dflash_aux_hidden
+
+    assert not _drafter_uses_dflash_aux_hidden(
+        {
+            "enable": True,
+            "enable_drafter_training": True,
+            "speculative_algorithm": "DFLASH2",
+            "training": {"collect_hidden_states_from_sgl": True},
+        }
+    )
+
+
+def test_vllm_dflash_path_accepts_a_dflash2_checkpoint(tmp_path) -> None:
+    """The DFLASH2 error tells users to serve the checkpoint as DFLASH.
+
+    That advice is only followable if the drafter validator accepts the DFlash2
+    architecture on the DFlash path.
+    """
+    import json
+
+    from verl_speco.integration.vllm_runtime import (
+        _validate_vllm_dflash_drafter_config,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["DFlash2DraftModel"]}), encoding="utf-8"
+    )
+    _validate_vllm_dflash_drafter_config(str(tmp_path), algorithm="DFLASH")
+
+
+def test_vllm_dflash_path_still_rejects_an_eagle_checkpoint(tmp_path) -> None:
+    import json
+
+    from verl_speco.integration.vllm_runtime import (
+        _validate_vllm_dflash_drafter_config,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="DFlash-family drafter checkpoint"):
+        _validate_vllm_dflash_drafter_config(str(tmp_path), algorithm="DFLASH")
+
+
+def test_dflash2_architecture_classifies_as_a_dflash_config() -> None:
+    """A serve-only run sets algorithm=DFLASH, so the architecture must classify."""
+    from types import SimpleNamespace
+
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_oldlogprob_aux_layer_ids,
+    )
+
+    layer_ids = resolve_oldlogprob_aux_layer_ids(
+        {"training": {"dflash_num_target_layers": 5}},
+        target_num_hidden_layers=36,
+        model_configs=[SimpleNamespace(architectures=["DFlash2DraftModel"])],
+    )
+    assert layer_ids is not None
+    assert len(layer_ids) == 5
