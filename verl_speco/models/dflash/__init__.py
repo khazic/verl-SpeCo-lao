@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .configuration_dflash import DEFAULT_ROPE_THETA, DFlashConfig, resolve_rope_theta
+from .configuration_dflash import DFlashConfig, resolve_rope_theta
 from .modeling_dflash import (
     DFlashAttention,
     DFlashDecoderLayer,
@@ -23,7 +23,6 @@ from .modeling_dflash import (
 )
 
 __all__ = [
-    "DEFAULT_ROPE_THETA",
     "DFlashConfig",
     "DFlashDraftModel",
     "DFlashAttention",

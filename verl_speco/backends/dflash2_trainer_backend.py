@@ -34,19 +34,6 @@ logger = logging.getLogger(__name__)
 # adds on top of the DFlash backbone.
 _DFLASH2_MODULE_KEY_MARKERS = ("attention_conv.", "mlp_conv.", "candidate_selector.")
 
-# Upstream z-lab DFlash2 checkpoints store the two selector codebooks as bare
-# ``nn.Parameter`` tensors, while this overlay holds them in ``nn.Embedding``
-# modules, whose state dict spells the same tensor with a trailing ``.weight``.
-# Every other DFlash2 parameter name already matches upstream exactly.
-_DFLASH2_CHECKPOINT_KEY_ALIASES = {
-    "candidate_selector.predecessor_codebook": (
-        "candidate_selector.predecessor_codebook.weight"
-    ),
-    "candidate_selector.successor_codebook": (
-        "candidate_selector.successor_codebook.weight"
-    ),
-}
-
 
 def _is_dflash2_module_key(key: str) -> bool:
     return any(marker in key for marker in _DFLASH2_MODULE_KEY_MARKERS)
@@ -170,6 +157,19 @@ class DFlash2TrainingModel(DFlashTrainingModel):
 
 
 class DFlash2TrainerBackend(DFlashTrainerBackend):
+    # Upstream z-lab DFlash2 checkpoints store the two selector codebooks as bare
+    # ``nn.Parameter`` tensors, while this overlay holds them in ``nn.Embedding``
+    # modules, whose state dict spells the same tensor with a trailing
+    # ``.weight``. Every other DFlash2 parameter name matches upstream exactly.
+    _CHECKPOINT_KEY_ALIASES = {
+        "candidate_selector.predecessor_codebook": (
+            "candidate_selector.predecessor_codebook.weight"
+        ),
+        "candidate_selector.successor_codebook": (
+            "candidate_selector.successor_codebook.weight"
+        ),
+    }
+
     @property
     def model_type(self):
         return "dflash2"
@@ -180,66 +180,36 @@ class DFlash2TrainerBackend(DFlashTrainerBackend):
             return value
         return training_cfg.get(dflash_key, default)
 
-    def _normalize_draft_state_dict(self, state_dict):
-        """Rename the upstream selector codebooks onto their ``nn.Embedding`` keys.
-
-        The base normalizer only strips wrapper prefixes, so without this the two
-        codebooks arrive under names the model does not have and are dropped by
-        ``_load_draft_checkpoint`` with nothing but a debug log.
-        """
-        normalized = super()._normalize_draft_state_dict(state_dict)
-        for source, target in _DFLASH2_CHECKPOINT_KEY_ALIASES.items():
-            if source not in normalized:
-                continue
-            value = normalized.pop(source)
-            normalized.setdefault(target, value)
-        return normalized
-
-    def _assert_dflash2_modules_are_complete(
+    def _validate_normalized_state(
         self, draft_model, normalized_state, model_path: str
     ) -> None:
         """Fail loud when a checkpoint carries DFlash2 modules under other names.
 
-        ``_load_draft_checkpoint`` drops keys the model does not have with only a
-        debug log, and its required-key gate covers the DFlash backbone only. An
-        upstream rename would therefore leave the convolutions or the selector
-        silently at their cold-start values, which reads as a merely weak drafter
-        rather than as a failed load. A checkpoint carrying none of these keys is
-        still accepted: warm-starting DFlash2 from a plain DFlash backbone is a
-        legitimate flow, and the DFlash2 modules cold-start as an identity
-        passthrough by design.
+        The base loader drops keys the model does not have, and its required-key
+        gate covers the DFlash backbone only. An upstream rename would therefore
+        leave the convolutions or the selector at their cold-start values, which
+        reads as a merely weak drafter rather than as a failed load. A checkpoint
+        carrying none of these keys is still accepted: warm-starting DFlash2 from
+        a plain DFlash backbone is a legitimate flow, and the DFlash2 modules
+        cold-start as an identity passthrough by design.
         """
         expected = {
             key for key in draft_model.state_dict() if _is_dflash2_module_key(key)
         }
         present = expected.intersection(normalized_state)
         stray = {
-            key for key in normalized_state if _is_dflash2_module_key(key)
-        }.difference(expected)
-        if not present and not stray:
-            return
-        if present == expected and not stray:
+            key
+            for key in normalized_state
+            if _is_dflash2_module_key(key) and key not in expected
+        }
+        if not stray and (not present or present == expected):
             return
         raise ValueError(
             "DFlash2 checkpoint carries only part of the DFlash2 modules under the "
             "expected parameter names, so the rest would silently stay at their "
             f"cold-start values: missing={sorted(expected - present)} "
             f"unrecognized={sorted(stray)} model_path={model_path}. Add the "
-            "renamed keys to _DFLASH2_CHECKPOINT_KEY_ALIASES."
-        )
-
-    def _load_draft_checkpoint(
-        self, draft_model, model_path: str, normalized_state=None
-    ) -> None:
-        if normalized_state is None:
-            normalized_state = self._normalize_draft_state_dict(
-                self._load_draft_state_dict(model_path)
-            )
-        self._assert_dflash2_modules_are_complete(
-            draft_model, normalized_state, model_path
-        )
-        super()._load_draft_checkpoint(
-            draft_model, model_path, normalized_state=normalized_state
+            "renamed keys to DFlash2TrainerBackend._CHECKPOINT_KEY_ALIASES."
         )
 
     def _resolved_block_size(self, drafter_config) -> int:

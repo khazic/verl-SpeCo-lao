@@ -22,7 +22,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
-from .configuration_dflash import DFlashConfig
+from .configuration_dflash import DFlashConfig, resolve_rope_theta
 from .flex_attention import compile_friendly_flex_attention
 
 
@@ -143,7 +143,7 @@ class DFlashAttention(nn.Module):
         self.rotary_emb = DFlashRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
-            base=getattr(config, "rope_theta", 10000.0),
+            base=resolve_rope_theta(config),
         )
 
     def forward(

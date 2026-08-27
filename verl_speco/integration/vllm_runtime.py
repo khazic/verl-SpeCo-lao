@@ -813,7 +813,10 @@ def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
 
 
 # Draft architectures vLLM can serve through its DFlash speculative path.
-_DFLASH_SERVABLE_ARCHITECTURES = frozenset({"DFlashDraftModel", "DFlash2DraftModel"})
+# Keep in sync with the alias sets in verl_speco/models/auto.py.
+_DFLASH_SERVABLE_ARCHITECTURES = frozenset(
+    {"DFlashDraftModel", "DFlash2DraftModel", "Qwen3DFlash2Model"}
+)
 
 
 def _validate_vllm_dflash_drafter_config(
@@ -850,7 +853,7 @@ def _validate_vllm_dflash_drafter_config(
     # and selector hyperparameters out of dflash_config), which is what the
     # DFLASH2 fail-loud above tells users to do, so its architecture has to be
     # accepted here or that advice would be unfollowable.
-    if architectures and not _DFLASH_SERVABLE_ARCHITECTURES.intersection(architectures):
+    if architectures and _DFLASH_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
         raise ValueError(
             "vLLM DFlash requires actor_rollout_ref.rollout.drafter.model_path "
             "to point to a DFlash-family drafter checkpoint with architectures in "

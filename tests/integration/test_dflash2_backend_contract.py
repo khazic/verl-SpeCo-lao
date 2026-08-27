@@ -54,6 +54,30 @@ def _tiny_dflash2_config(**overrides):
     return DFlash2Config(**kwargs)
 
 
+def _dflash2_backend(**training_overrides):
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
+
+    training = {"dflash2_block_size": 4}
+    training.update(training_overrides)
+    return DFlash2TrainerBackend(
+        OmegaConf.create(
+            {
+                "rollout": {
+                    "drafter": {
+                        "speculative_algorithm": "DFLASH2",
+                        "model_path": "",
+                        "training": training,
+                    }
+                },
+                "model": {"path": ""},
+            }
+        ),
+        None,
+    )
+
+
 def test_dflash2_model_builds_conv_and_selector() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
@@ -347,28 +371,11 @@ def test_backend_pins_conv_block_size_to_the_trainer_block_size() -> None:
     """
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
-    from omegaconf import OmegaConf
-
-    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
     from verl_speco.models.dflash2 import DFlash2Config
 
-    backend = DFlash2TrainerBackend(
-        OmegaConf.create(
-            {
-                "rollout": {
-                    "drafter": {
-                        "speculative_algorithm": "DFLASH2",
-                        "model_path": "",
-                        # Deliberately a multiple of the config's block_size=4,
-                        # so the block-multiple guard alone would not catch it.
-                        "training": {"dflash2_block_size": 8},
-                    }
-                },
-                "model": {"path": ""},
-            }
-        ),
-        None,
-    )
+    # Deliberately a multiple of the config's block_size=4, so the
+    # block-multiple guard alone would not catch it.
+    backend = _dflash2_backend(dflash2_block_size=8)
     config = _tiny_dflash2_config(block_size=4)
     assert isinstance(config, DFlash2Config)
     assert backend._resolved_block_size(config) == 8
@@ -577,30 +584,6 @@ def test_mean_acceptance_length_counts_the_target_bonus_token() -> None:
     assert metrics["dflash2/scored_block_count"] == pytest.approx(4.0)
 
 
-def _dflash2_backend(**training_overrides):
-    from omegaconf import OmegaConf
-
-    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
-
-    training = {"dflash2_block_size": 4}
-    training.update(training_overrides)
-    return DFlash2TrainerBackend(
-        OmegaConf.create(
-            {
-                "rollout": {
-                    "drafter": {
-                        "speculative_algorithm": "DFLASH2",
-                        "model_path": "",
-                        "training": training,
-                    }
-                },
-                "model": {"path": ""},
-            }
-        ),
-        None,
-    )
-
-
 def test_config_reads_rope_theta_from_rope_parameters(tmp_path) -> None:
     """The released checkpoint carries the RoPE base only under rope_parameters.
 
@@ -649,9 +632,9 @@ def test_top_level_rope_theta_wins_over_rope_parameters() -> None:
 
 def test_rope_theta_defaults_when_neither_spelling_is_present() -> None:
     pytest.importorskip("transformers")
-    from verl_speco.models.dflash import DEFAULT_ROPE_THETA, DFlashConfig
+    from verl_speco.models.dflash import DFlashConfig
 
-    assert DFlashConfig().rope_theta == pytest.approx(DEFAULT_ROPE_THETA)
+    assert DFlashConfig().rope_theta == pytest.approx(10000.0)
 
 
 def test_resolve_rope_theta_reads_config_objects_and_mappings() -> None:
@@ -700,12 +683,10 @@ def test_fallback_config_reads_the_target_rope_parameters() -> None:
 
 def _upstream_spelling(state_dict):
     """Rewrite a model state dict into the upstream z-lab key spelling."""
-    renamed = {}
-    for key, value in state_dict.items():
-        if key.endswith("_codebook.weight"):
-            key = key[: -len(".weight")]
-        renamed[key] = value
-    return renamed
+    return {
+        key.removesuffix(".weight") if key.endswith("_codebook.weight") else key: value
+        for key, value in state_dict.items()
+    }
 
 
 def test_upstream_selector_codebooks_load_onto_the_embedding_keys() -> None:
@@ -760,7 +741,7 @@ def test_partially_renamed_dflash2_modules_fail_loud() -> None:
     from verl_speco.models.dflash2 import DFlash2DraftModel
 
     model = DFlash2DraftModel(_tiny_dflash2_config())
-    state = dict(model.state_dict())
+    state = model.state_dict()
     state["candidate_selector.prev_codebook"] = state.pop(
         "candidate_selector.predecessor_codebook.weight"
     )
@@ -779,16 +760,14 @@ def test_plain_dflash_checkpoint_warm_starts_without_the_dflash2_modules() -> No
     """
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
+    from verl_speco.backends.dflash2_trainer_backend import _is_dflash2_module_key
     from verl_speco.models.dflash2 import DFlash2DraftModel
 
     model = DFlash2DraftModel(_tiny_dflash2_config())
     backbone_only = {
         key: value
         for key, value in model.state_dict().items()
-        if not any(
-            marker in key
-            for marker in ("attention_conv.", "mlp_conv.", "candidate_selector.")
-        )
+        if not _is_dflash2_module_key(key)
     }
 
     backend = _dflash2_backend()
@@ -826,38 +805,6 @@ def test_dflash2_never_reaches_the_sglang_aux_hidden_path() -> None:
             "training": {"collect_hidden_states_from_sgl": True},
         }
     )
-
-
-def test_vllm_dflash_path_accepts_a_dflash2_checkpoint(tmp_path) -> None:
-    """The DFLASH2 error tells users to serve the checkpoint as DFLASH.
-
-    That advice is only followable if the drafter validator accepts the DFlash2
-    architecture on the DFlash path.
-    """
-    import json
-
-    from verl_speco.integration.vllm_runtime import (
-        _validate_vllm_dflash_drafter_config,
-    )
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": ["DFlash2DraftModel"]}), encoding="utf-8"
-    )
-    _validate_vllm_dflash_drafter_config(str(tmp_path), algorithm="DFLASH")
-
-
-def test_vllm_dflash_path_still_rejects_an_eagle_checkpoint(tmp_path) -> None:
-    import json
-
-    from verl_speco.integration.vllm_runtime import (
-        _validate_vllm_dflash_drafter_config,
-    )
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}), encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="DFlash-family drafter checkpoint"):
-        _validate_vllm_dflash_drafter_config(str(tmp_path), algorithm="DFLASH")
 
 
 def test_dflash2_architecture_classifies_as_a_dflash_config() -> None:

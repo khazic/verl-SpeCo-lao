@@ -717,6 +717,11 @@ class DFlashTrainingModel(nn.Module):
 
 
 class DFlashTrainerBackend:
+    # Checkpoint parameter names that differ from this overlay's own spelling,
+    # as ``{checkpoint key: model key}``. Variants fill this in when the released
+    # checkpoint holds a tensor in a different module type than the overlay does.
+    _CHECKPOINT_KEY_ALIASES: dict[str, str] = {}
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
@@ -862,7 +867,26 @@ class DFlashTrainerBackend:
                     normalized_key = normalized_key[len(prefix) :]
                     break
             normalized_state[normalized_key] = value
+        # Aliases run after prefix stripping, and a key already spelled the way
+        # the model spells it wins, so a checkpoint this overlay wrote itself is
+        # never rewritten.
+        for source, target in self._CHECKPOINT_KEY_ALIASES.items():
+            if source in normalized_state:
+                normalized_state.setdefault(target, normalized_state.pop(source))
         return normalized_state
+
+    def _validate_normalized_state(
+        self,
+        draft_model: DFlashDraftModel,
+        normalized_state: dict[str, torch.Tensor],
+        model_path: str,
+    ) -> None:
+        """Variant hook to reject a checkpoint the base gate cannot judge.
+
+        The base gate only knows the DFlash backbone, and unrecognized keys are
+        dropped rather than raised on, so a variant whose extra modules arrive
+        under other names must say so here.
+        """
 
     def _infer_num_context_layers_from_state(
         self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int
@@ -1008,6 +1032,7 @@ class DFlashTrainerBackend:
                 "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
                 f"missing={missing_backbone_keys} model_path={model_path}"
             )
+        self._validate_normalized_state(draft_model, normalized_state, model_path)
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -1031,7 +1056,12 @@ class DFlashTrainerBackend:
 
         missing, _ = draft_model.load_state_dict(filtered_state, strict=False)
         if unexpected or missing or mismatched:
-            logger.debug(
+            # Dropped and shape-mismatched keys mean checkpoint tensors did not
+            # reach the model, which shows up later only as a weak drafter, so
+            # say so at warning level. Missing keys alone are routine (the
+            # embedding is loaded separately), so they stay at debug.
+            log = logger.warning if (unexpected or mismatched) else logger.debug
+            log(
                 "DFlash draft checkpoint load report from %s: loaded=%s missing=%s unexpected=%s mismatched=%s",
                 model_path,
                 len(filtered_state),
