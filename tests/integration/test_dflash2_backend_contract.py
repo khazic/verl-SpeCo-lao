@@ -638,6 +638,7 @@ def test_rope_theta_defaults_when_neither_spelling_is_present() -> None:
 
 
 def test_resolve_rope_theta_reads_config_objects_and_mappings() -> None:
+    pytest.importorskip("transformers")
     from types import SimpleNamespace
 
     from verl_speco.models.dflash import resolve_rope_theta
@@ -831,6 +832,7 @@ def test_scaled_rope_is_warned_about_not_silently_dropped(caplog) -> None:
     has to be said out loud rather than discarded with the rest of
     ``rope_parameters``.
     """
+    pytest.importorskip("transformers")
     import logging
 
     from verl_speco.models.dflash import configuration_dflash
@@ -854,6 +856,7 @@ def test_scaled_rope_is_warned_about_not_silently_dropped(caplog) -> None:
 
 
 def test_default_rope_type_is_not_warned_about(caplog) -> None:
+    pytest.importorskip("transformers")
     import logging
 
     from verl_speco.models.dflash import configuration_dflash
