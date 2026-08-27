@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import logging
 import os
 from collections.abc import Mapping
 from typing import Any, Optional
 
 from transformers import PretrainedConfig
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ROPE_THETA = 10000.0
+
+# rope_type values that need no scaling beyond the base.
+_UNSCALED_ROPE_TYPES = frozenset({"default", ""})
+
+# rope_type values already warned about, so a per-layer rotary build does not
+# repeat the same line once per decoder layer.
+_WARNED_ROPE_TYPES: set[str] = set()
 
 
 def _lookup(source: Any, key: str):
@@ -28,6 +38,32 @@ def _lookup(source: Any, key: str):
     if isinstance(source, Mapping):
         return source.get(key)
     return getattr(source, key, None)
+
+
+def _warn_once_if_scaling_is_ignored(source: Any, rope_parameters: Any) -> None:
+    """Warn when the config asks for RoPE scaling the DFlash draft cannot apply.
+
+    ``DFlashRotaryEmbedding`` takes only a base, so a target using yarn, linear
+    or llama3 scaling gets a draft whose rotary phase diverges from it past the
+    original context length. That is invisible for the same reason a defaulted
+    base is, so say it once per distinct ``rope_type``.
+    """
+    rope_type = _lookup(rope_parameters, "rope_type")
+    if rope_type is None:
+        rope_scaling = _lookup(source, "rope_scaling")
+        rope_type = _lookup(rope_scaling, "rope_type") or _lookup(rope_scaling, "type")
+    if rope_type is None:
+        return
+    rope_type = str(rope_type)
+    if rope_type in _UNSCALED_ROPE_TYPES or rope_type in _WARNED_ROPE_TYPES:
+        return
+    _WARNED_ROPE_TYPES.add(rope_type)
+    logger.warning(
+        "DFlash draft RoPE ignores rope_type=%r: the draft rotary applies the base only, "
+        "so its phase diverges from a target using scaled RoPE beyond the original "
+        "context length.",
+        rope_type,
+    )
 
 
 def resolve_rope_theta(source: Any, default: float = DEFAULT_ROPE_THETA) -> float:
@@ -49,10 +85,12 @@ def resolve_rope_theta(source: Any, default: float = DEFAULT_ROPE_THETA) -> floa
     Returns:
         float: The resolved RoPE base.
     """
+    rope_parameters = _lookup(source, "rope_parameters")
+    _warn_once_if_scaling_is_ignored(source, rope_parameters)
     top_level = _lookup(source, "rope_theta")
     if top_level is not None:
         return float(top_level)
-    nested = _lookup(_lookup(source, "rope_parameters"), "rope_theta")
+    nested = _lookup(rope_parameters, "rope_theta")
     if nested is not None:
         return float(nested)
     return float(default)

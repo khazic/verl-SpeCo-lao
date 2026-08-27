@@ -822,3 +822,44 @@ def test_dflash2_architecture_classifies_as_a_dflash_config() -> None:
     )
     assert layer_ids is not None
     assert len(layer_ids) == 5
+
+
+def test_scaled_rope_is_warned_about_not_silently_dropped(caplog) -> None:
+    """The draft rotary applies the base only, so a scaled target diverges.
+
+    That divergence is invisible for the same reason a defaulted base is, so it
+    has to be said out loud rather than discarded with the rest of
+    ``rope_parameters``.
+    """
+    import logging
+
+    from verl_speco.models.dflash import configuration_dflash
+
+    configuration_dflash._WARNED_ROPE_TYPES.discard("yarn")
+    with caplog.at_level(logging.WARNING, logger=configuration_dflash.__name__):
+        theta = configuration_dflash.resolve_rope_theta(
+            {"rope_parameters": {"rope_theta": 5e5, "rope_type": "yarn", "factor": 4.0}}
+        )
+
+    assert theta == pytest.approx(5e5)
+    assert "rope_type='yarn'" in caplog.text
+
+    # Warned once per distinct rope_type, not once per decoder layer.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=configuration_dflash.__name__):
+        configuration_dflash.resolve_rope_theta(
+            {"rope_parameters": {"rope_theta": 5e5, "rope_type": "yarn"}}
+        )
+    assert caplog.text == ""
+
+
+def test_default_rope_type_is_not_warned_about(caplog) -> None:
+    import logging
+
+    from verl_speco.models.dflash import configuration_dflash
+
+    with caplog.at_level(logging.WARNING, logger=configuration_dflash.__name__):
+        configuration_dflash.resolve_rope_theta(
+            {"rope_parameters": {"rope_theta": 1e7, "rope_type": "default"}}
+        )
+    assert caplog.text == ""
