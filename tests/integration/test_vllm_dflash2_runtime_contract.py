@@ -22,6 +22,7 @@ import pytest
 from verl_speco.integration import vllm_runtime
 from verl_speco.integration.vllm_runtime import (
     _assert_vllm_supports_dflash2,
+    _dflash2_engine_param_name,
     _draft_param_name_candidates,
     _normalize_dflash2_runtime_aliases,
     _validate_vllm_dflash2_block_size,
@@ -275,3 +276,23 @@ def test_dflash2_runtime_aliases_refuse_conflicts() -> None:
         _normalize_dflash2_runtime_aliases(
             {"architectures": ["DFlash2DraftModel"], "dflash_config": "bad"}
         )
+
+
+def test_dflash2_engine_param_name_renames_only_the_codebooks() -> None:
+    """The IPC receiver hands vLLM's load_weights the engine spelling."""
+    assert (
+        _dflash2_engine_param_name("candidate_selector.predecessor_codebook.weight")
+        == "candidate_selector.predecessor_codebook"
+    )
+    assert (
+        _dflash2_engine_param_name("candidate_selector.successor_codebook.weight")
+        == "candidate_selector.successor_codebook"
+    )
+    for untouched in (
+        "candidate_selector.hidden_projection.weight",
+        "candidate_selector.predecessor_codebook",
+        "layers.0.attention_conv.base_kernel",
+        "layers.0.mlp_conv.kernel_projection.weight",
+        "fc.weight",
+    ):
+        assert _dflash2_engine_param_name(untouched) == untouched

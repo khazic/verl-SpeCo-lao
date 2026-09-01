@@ -838,6 +838,22 @@ _DFLASH2_CODEBOOK_SUFFIX = re.compile(
 )
 
 
+def _dflash2_engine_param_name(name: str) -> str:
+    """Spell a published DFlash2 parameter the way vLLM's draft names it.
+
+    The trainer keeps the selector codebooks in ``nn.Embedding`` modules
+    (``..._codebook.weight``) while vLLM's ``CandidateSelector`` holds them as
+    bare parameters (``..._codebook``), like the released z-lab checkpoints;
+    every other DFlash2 parameter already matches. vLLM's ``load_weights``
+    refuses the trainer spelling ("Attempted to load nested weight ... into a
+    single parameter"), so the rename has to happen before the weights reach
+    the engine.
+    """
+    if _DFLASH2_CODEBOOK_SUFFIX.search(name):
+        return name[: -len(".weight")]
+    return name
+
+
 def _normalize_dflash2_runtime_aliases(config: Any) -> bool:
     """Mirror DFlash2 hyperparameters into ``dflash_config`` for vLLM.
 
@@ -2370,11 +2386,9 @@ def _draft_param_name_candidates(name: str) -> list[str]:
         candidates.append(candidate)
         if "midlayer." in candidate:
             candidates.append(candidate.replace("midlayer.", "model.layers.0."))
-        # The trainer keeps the DFlash2 selector codebooks in nn.Embedding
-        # modules (``..._codebook.weight``); vLLM's CandidateSelector holds them as
-        # bare parameters (``..._codebook``), like the released z-lab checkpoints.
-        if _DFLASH2_CODEBOOK_SUFFIX.search(candidate):
-            candidates.append(candidate[: -len(".weight")])
+        engine_name = _dflash2_engine_param_name(candidate)
+        if engine_name != candidate:
+            candidates.append(engine_name)
     for candidate in list(candidates):
         if not candidate.startswith("model."):
             candidates.append(f"model.{candidate}")
@@ -2993,6 +3007,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                         changed = True
             if "midlayer." in n:
                 n = n.replace("midlayer.", "layers.0.")
+            if is_dflash:
+                # DFlash2 selector codebooks: trainer ``.weight`` -> engine bare
+                # parameter; vLLM's load_weights rejects the trainer spelling.
+                n = _dflash2_engine_param_name(n)
             if (
                 is_eagle3
                 and n != "lm_head.weight"
