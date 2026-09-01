@@ -239,6 +239,15 @@ if [[ "${drafter}" == "dflash" ]]; then
   )
 fi
 
+if [[ "${drafter}" == "dflash2" ]]; then
+  overrides+=(
+    "actor_rollout_ref.rollout.drafter.training.dflash2_block_size=${SPECO_DFLASH2_BLOCK_SIZE:-8}"
+    "actor_rollout_ref.rollout.drafter.training.dflash2_num_anchors=${SPECO_DFLASH2_NUM_ANCHORS:-8}"
+    "actor_rollout_ref.rollout.drafter.training.dflash2_loss_decay_gamma=${SPECO_DFLASH2_LOSS_DECAY_GAMMA:-7}"
+    "actor_rollout_ref.rollout.drafter.training.dflash_max_window=${SPECO_DFLASH_MAX_WINDOW:-64}"
+  )
+fi
+
 if [[ "${drafter}" == "dspark" ]]; then
   overrides+=(
     "actor_rollout_ref.rollout.drafter.rollout.spec_steps=${SPECO_DSPARK_SPEC_STEPS:-1}"
