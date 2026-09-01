@@ -15,6 +15,9 @@ case "${platform}/${backend}/${drafter}" in
   gpu/vllm/dspark)
     example="examples/run_qwen3-8b_drafter_dspark_vllm.sh"
     ;;
+  gpu/vllm/dflash2)
+    example="examples/run_qwen3-8b_drafter_dflash2_vllm.sh"
+    ;;
   gpu/vllm/peagle|gpu/vllm/domino)
     example="examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
     ;;
@@ -43,7 +46,7 @@ case "${platform}/${backend}/${drafter}" in
     example="examples/run_qwen3-8b_drafter_dflash_sglang.sh"
     ;;
   *)
-    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dspark|peagle|domino}" >&2
+    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dflash2|dspark|peagle|domino}" >&2
     exit 2
     ;;
 esac
@@ -69,6 +72,7 @@ done
 # The example owns the collect-to-train algorithm pairing; the runner only needs
 # the collect side of it to pick the matching cached draft model.
 separate_training="false"
+spec_verify_tokens_default="4"
 
 case "${drafter}" in
   eagle3|megatron-eagle3)
@@ -82,6 +86,13 @@ case "${drafter}" in
   dspark)
     draft_model="${SPECO_DSPARK_DRAFT_MODEL:-}"
     draft_algorithm="DSPARK"
+    ;;
+  dflash2)
+    draft_model="${SPECO_DFLASH2_DRAFT_MODEL:-}"
+    draft_algorithm="DFLASH2"
+    # vLLM sizes the DFlash2 convolution block as 1 + spec_verify_tokens, and
+    # the trainer folds by dflash2_block_size (default 8), so the two must agree.
+    spec_verify_tokens_default="7"
     ;;
   peagle)
     draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
@@ -186,7 +197,7 @@ overrides=(
   "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${SPECO_REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
   "actor_rollout_ref.rollout.drafter.rollout.spec_steps=${SPECO_SPEC_STEPS:-3}"
   "actor_rollout_ref.rollout.drafter.rollout.spec_topk=${SPECO_SPEC_TOPK:-1}"
-  "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_SPEC_VERIFY_TOKENS:-4}"
+  "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_SPEC_VERIFY_TOKENS:-${spec_verify_tokens_default}}"
   "actor_rollout_ref.rollout.drafter.training.step=${SPECO_DRAFTER_TRAINING_STEPS:-1}"
   "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=${SPECO_DRAFTER_BATCH_SIZE_PER_GPU:-1}"
   "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=${SPECO_COLLECT_INTERVAL_STEPS:-1}"

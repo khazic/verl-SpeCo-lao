@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -814,31 +815,173 @@ def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
 
 # Draft architectures vLLM can serve through its DFlash speculative path.
 # Keep in sync with the alias sets in verl_speco/models/auto.py.
+_DFLASH2_SERVABLE_ARCHITECTURES = frozenset({"DFlash2DraftModel", "Qwen3DFlash2Model"})
 _DFLASH_SERVABLE_ARCHITECTURES = frozenset(
-    {"DFlashDraftModel", "DFlash2DraftModel", "Qwen3DFlash2Model"}
+    {"DFlashDraftModel", *_DFLASH2_SERVABLE_ARCHITECTURES}
+)
+# Hyperparameters vLLM's DFlash2 draft (qwen3_dflash2.py) indexes straight out of
+# ``dflash_config`` when it builds the model; a missing key is a KeyError deep in
+# engine startup, so the checkpoint contract is checked up front instead.
+_DFLASH2_RUNTIME_KEYS = (
+    "conv_kernel_size",
+    "conv_group_size",
+    "selector_rank",
+    "selector_top_k",
+)
+# vLLM module that carries the DFlash2 draft class; its presence is the
+# capability probe for DFlash2 rollout (vllm-project/vllm#52816, v0.28.0+).
+_VLLM_DFLASH2_MODULE = "vllm.model_executor.models.qwen3_dflash2"
+# Trainer-side spelling of the DFlash2 selector codebooks (see
+# ``_draft_param_name_candidates`` for the engine-side rename).
+_DFLASH2_CODEBOOK_SUFFIX = re.compile(
+    r"candidate_selector\.(predecessor|successor)_codebook\.weight$"
 )
 
 
-def _validate_vllm_dflash_drafter_config(
-    spec_model_path: Any, algorithm: str = "DFLASH"
-) -> None:
-    if not spec_model_path:
-        return
+def _normalize_dflash2_runtime_aliases(config: Any) -> bool:
+    """Mirror DFlash2 hyperparameters into ``dflash_config`` for vLLM.
 
-    config_path = os.path.join(os.fspath(spec_model_path), "config.json")
-    if not os.path.exists(config_path):
-        return
+    vLLM's DFlash2 draft reads the convolution and selector knobs strictly from
+    ``dflash_config`` (the z-lab checkpoint layout), while a checkpoint this
+    overlay saved carries them at the top level. Copy missing keys down so both
+    layouts serve; a conflicting pair is a corrupt checkpoint and fails loud.
+    """
+    architectures = _get_nested(config, ("architectures",), None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if _DFLASH2_SERVABLE_ARCHITECTURES.isdisjoint(str(name) for name in architectures):
+        return False
+
+    dflash_config = _get_nested(config, ("dflash_config",), None)
+    if dflash_config is not None and not hasattr(dflash_config, "get"):
+        raise TypeError("DFlash2 dflash_config must be a mapping when provided")
+    changed = False
+    for key in (*_DFLASH2_RUNTIME_KEYS, "block_size"):
+        top_level = _get_nested(config, (key,), None)
+        nested = _get_nested(dflash_config, (key,), None)
+        if top_level is None or top_level == nested:
+            continue
+        if nested is not None:
+            raise ValueError(
+                f"DFlash2 {key} conflicts with dflash_config.{key}: {top_level!r} != {nested!r}"
+            )
+        if dflash_config is None:
+            dflash_config = {}
+            _set_child(config, "dflash_config", dflash_config)
+        _set_child(dflash_config, key, top_level)
+        changed = True
+    return changed
+
+
+def _vllm_supports_dflash2() -> bool | None:
+    """Whether the installed vLLM ships the DFlash2 draft; ``None`` without vLLM."""
+    import importlib.util
 
     try:
+        if importlib.util.find_spec("vllm") is None:
+            return None
+        return importlib.util.find_spec(_VLLM_DFLASH2_MODULE) is not None
+    except (ImportError, ValueError):
+        return None
+
+
+def _assert_vllm_supports_dflash2() -> None:
+    if _vllm_supports_dflash2() is False:
+        raise ValueError(
+            "DFLASH2 rollout needs a vLLM that ships the DFlash2 draft model "
+            f"({_VLLM_DFLASH2_MODULE}, vllm-project/vllm#52816, released in vLLM 0.28.0); "
+            "the installed vLLM does not have it. Upgrade vLLM, or keep "
+            "actor_rollout_ref.rollout.drafter.enable=false and train the DFlash2 drafter offline."
+        )
+
+
+def _dflash2_config_value(config: dict[str, Any], key: str) -> Any:
+    """Read a DFlash2 knob from the checkpoint config, top level first."""
+    if key in config:
+        return config[key]
+    nested = config.get("dflash_config")
+    if isinstance(nested, dict):
+        return nested.get(key)
+    return None
+
+
+def _validate_vllm_dflash2_block_size(
+    config: dict[str, Any] | None,
+    drafter_cfg: dict[str, Any],
+    num_speculative_tokens: int,
+) -> None:
+    """Pin the DFlash2 block to the engine's ``1 + num_speculative_tokens``.
+
+    The dynamic convolutions are causal *within* a block: vLLM sizes that block
+    as the bonus token plus ``num_speculative_tokens`` mask tokens, while the
+    trainer folds the drafted sequence by ``dflash2_block_size``. If the two
+    disagree, the served conv reads across positions the trained conv never saw
+    (or vice versa), which shows up as a silently weak drafter rather than an
+    error, so refuse the mismatch here.
+    """
+    training_cfg = drafter_cfg.get("training") or {}
+    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
+    if block_size is None and config is not None:
+        block_size = _positive_int_or_none(_dflash2_config_value(config, "block_size"))
+    if block_size is None:
+        return
+    if int(num_speculative_tokens) + 1 != int(block_size):
+        raise ValueError(
+            "DFLASH2 rollout requires actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens "
+            "== block_size - 1 so the served convolution block matches the trained one: got "
+            f"spec_verify_tokens={num_speculative_tokens} but block_size={block_size} "
+            "(from drafter.training.dflash2_block_size or the checkpoint's dflash_config)."
+        )
+
+
+def _load_vllm_dflash_drafter_config(spec_model_path: Any) -> dict[str, Any] | None:
+    if not spec_model_path:
+        return None
+    config_path = os.path.join(os.fspath(spec_model_path), "config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
         with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            return json.load(f)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Invalid DFlash drafter config.json at {config_path}: {exc}"
         ) from exc
 
+
+def _validate_vllm_dflash_drafter_config(
+    spec_model_path: Any, algorithm: str = "DFLASH"
+) -> None:
+    config = _load_vllm_dflash_drafter_config(spec_model_path)
+    if config is None:
+        return
+    config_path = os.path.join(os.fspath(spec_model_path), "config.json")
+
     architectures = config.get("architectures") or []
     algorithm = str(algorithm or "DFLASH").strip().upper()
+    if algorithm == "DFLASH2":
+        # vLLM dispatches on the architecture: only the DFlash2 names reach the
+        # draft class with the convolutions and the selector. A plain DFlash
+        # checkpoint would load fine and silently serve without them.
+        if _DFLASH2_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
+            raise ValueError(
+                "vLLM DFLASH2 requires actor_rollout_ref.rollout.drafter.model_path to point "
+                "to a DFlash2 drafter checkpoint with architectures in "
+                f"{sorted(_DFLASH2_SERVABLE_ARCHITECTURES)}; got architectures={architectures!r} "
+                f"from {config_path}. Use speculative_algorithm=DFLASH for a plain DFlash drafter."
+            )
+        missing = [
+            key
+            for key in _DFLASH2_RUNTIME_KEYS
+            if _dflash2_config_value(config, key) is None
+        ]
+        if missing:
+            raise ValueError(
+                "vLLM DFLASH2 requires the drafter config.json to carry the DFlash2 "
+                f"hyperparameters {list(_DFLASH2_RUNTIME_KEYS)} (top level or under dflash_config); "
+                f"missing {missing} in {config_path}."
+            )
+        return
     if algorithm == "DSPARK":
         if not _is_dspark_config(config):
             raise ValueError(
@@ -922,18 +1065,15 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "drafter training."
         )
     if algorithm == "DFLASH2":
-        # Same story as Domino: DFlash2 is a DFlash variant whose extra modules
-        # (dynamic convolutions + candidate selector) ride in the checkpoint's
-        # dflash_config, not a distinct engine-level method. DFLASH2 is never a
-        # valid vLLM method, so fail loud instead of forwarding the raw string,
-        # mirroring sglang_runtime._server_args_overrides_from_drafter.
-        raise ValueError(
-            "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
-            "checkpoint. Keep DFLASH2 for drafter training (which this overlay runs offline) and "
-            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
-            "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
-            "convolution and selector hyperparameters."
-        )
+        # DFlash2 is a DFlash variant, not an engine-level method: vLLM runs it
+        # through the DFlash proposer (method="dflash") and picks the DFlash2 draft
+        # class (dynamic convolutions + candidate selector, vllm-project/vllm#52816,
+        # first released in v0.28.0) from the checkpoint's ``DFlash2DraftModel``
+        # architecture. DFLASH2 itself is never a valid vLLM method string, so map
+        # it here; the checkpoint contract is enforced by
+        # ``_validate_vllm_dflash_drafter_config`` and the engine capability by
+        # ``_assert_vllm_supports_dflash2``.
+        return "dflash"
     if algorithm == "DSPARK":
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
@@ -1069,6 +1209,13 @@ def build_vllm_speculative_config_from_drafter(
             raise ValueError(
                 "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens "
                 f"must be positive for vLLM {method.upper()} speculative decoding"
+            )
+        if algorithm == "DFLASH2":
+            _assert_vllm_supports_dflash2()
+            _validate_vllm_dflash2_block_size(
+                _load_vllm_dflash_drafter_config(spec_model_path),
+                drafter_cfg,
+                num_speculative_tokens,
             )
     else:
         num_speculative_tokens = _positive_int_or_none(
@@ -1728,6 +1875,7 @@ def patch_vllm_dflash_config_aliases() -> bool:
         current(self, *args, **kwargs)
         if str(method or "eagle").strip().lower() == "dflash":
             _normalize_dflash_target_layer_aliases(self)
+            _normalize_dflash2_runtime_aliases(self)
             if _is_dspark_hf_config(self):
                 _set_child(self, "architectures", ["DFlashDraftModel"])
 
@@ -2222,6 +2370,11 @@ def _draft_param_name_candidates(name: str) -> list[str]:
         candidates.append(candidate)
         if "midlayer." in candidate:
             candidates.append(candidate.replace("midlayer.", "model.layers.0."))
+        # The trainer keeps the DFlash2 selector codebooks in nn.Embedding
+        # modules (``..._codebook.weight``); vLLM's CandidateSelector holds them as
+        # bare parameters (``..._codebook``), like the released z-lab checkpoints.
+        if _DFLASH2_CODEBOOK_SUFFIX.search(candidate):
+            candidates.append(candidate[: -len(".weight")])
     for candidate in list(candidates):
         if not candidate.startswith("model."):
             candidates.append(f"model.{candidate}")
