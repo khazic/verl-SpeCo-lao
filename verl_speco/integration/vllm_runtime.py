@@ -2438,6 +2438,33 @@ async def _maybe_call_vllm_server_method(
     return await method.remote(*args, **kwargs)
 
 
+@contextmanager
+def _ipc_safe_allocator(enabled: bool):
+    """Stage the IPC buckets in non-expandable CUDA segments.
+
+    CUDA tensors shared over IPC out of an expandable segment carry an fd-based
+    handle that the receiver can only import through ``pidfd_getfd`` (Linux >=
+    5.6); on older kernels the vLLM worker fails the whole draft update with
+    "does not support the pidfd_getfd syscall". verl's own actor->rollout sync
+    flips expandable segments off around its send for the same reason and turns
+    them back on afterwards, so the draft publish mirrors that. A verl without
+    the helper never enabled expandable segments, so there is nothing to do.
+    """
+    if not enabled:
+        yield
+        return
+    try:
+        from verl.utils.device import set_expandable_segments
+    except ImportError:
+        yield
+        return
+    set_expandable_segments(False)
+    try:
+        yield
+    finally:
+        set_expandable_segments(True)
+
+
 async def speco_vllm_update_draft_weights(
     self, weights: Any, *args, global_steps: int | None = None, **kwargs
 ):
@@ -2494,12 +2521,15 @@ async def speco_vllm_update_draft_weights(
             kwargs={**kwargs, "use_shm": use_shm},
         )
 
-        sender = BucketedWeightSender(
-            zmq_handle=_draft_zmq_handle_from_base(self.zmq_handle),
-            bucket_size_mb=int(bucket_mb),
-            use_shm=use_shm,
-        )
-        await sender.async_send_weights(_named_weight_iter(weights))
+        # Only the CUDA-IPC transport shares device allocations; shm stages
+        # through host memory and is unaffected by the allocator mode.
+        with _ipc_safe_allocator(not use_shm):
+            sender = BucketedWeightSender(
+                zmq_handle=_draft_zmq_handle_from_base(self.zmq_handle),
+                bucket_size_mb=int(bucket_mb),
+                use_shm=use_shm,
+            )
+            await sender.async_send_weights(_named_weight_iter(weights))
 
         if future is not None:
             await future
