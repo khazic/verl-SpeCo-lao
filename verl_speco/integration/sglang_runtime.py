@@ -36,6 +36,7 @@ from typing import Any, Optional, cast
 from verl_speco.integration.vllm_runtime import (
     _dflash2_config_value,
     _dflash2_engine_param_name,
+    _ipc_safe_allocator,
     _load_vllm_dflash_drafter_config,
     _validate_vllm_dflash_drafter_config,
 )
@@ -976,10 +977,14 @@ async def _sgl_update_weights_with_route(
             )
         return _preprocess_tensor_for_update_weights(tensor)
 
-    named_tensors_batch = [
-        (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
-        for name, tensor in params_batch
-    ]
+    # Stage and serialize in non-expandable CUDA segments: tensors shared over
+    # IPC out of an expandable segment need pidfd_getfd (Linux >= 5.6) on the
+    # receiving SGLang worker, exactly like the vLLM bucketed send.
+    with _ipc_safe_allocator(True):
+        named_tensors_batch = [
+            (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
+            for name, tensor in params_batch
+        ]
     gathered_serialized_batches = (
         [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
     )
