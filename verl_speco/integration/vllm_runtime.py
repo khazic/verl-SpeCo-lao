@@ -27,7 +27,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -822,6 +821,10 @@ _DFLASH_SERVABLE_ARCHITECTURES = frozenset(
 # Hyperparameters vLLM's DFlash2 draft (qwen3_dflash2.py) indexes straight out of
 # ``dflash_config`` when it builds the model; a missing key is a KeyError deep in
 # engine startup, so the checkpoint contract is checked up front instead.
+# Superset lists of the nested-key contract live in
+# verl_speco/models/dflash2/configuration_dflash2.py (_NESTED_DFLASH_KEYS) and
+# verl_speco/convert_speculators_dflash2.py (_DFLASH2_KEYS); they cannot be
+# imported here because this module must stay importable without transformers.
 _DFLASH2_RUNTIME_KEYS = (
     "conv_kernel_size",
     "conv_group_size",
@@ -831,10 +834,11 @@ _DFLASH2_RUNTIME_KEYS = (
 # vLLM module that carries the DFlash2 draft class; its presence is the
 # capability probe for DFlash2 rollout (vllm-project/vllm#52816, v0.28.0+).
 _VLLM_DFLASH2_MODULE = "vllm.model_executor.models.qwen3_dflash2"
-# Trainer-side spelling of the DFlash2 selector codebooks (see
-# ``_draft_param_name_candidates`` for the engine-side rename).
-_DFLASH2_CODEBOOK_SUFFIX = re.compile(
-    r"candidate_selector\.(predecessor|successor)_codebook\.weight$"
+# Trainer-side spelling of the DFlash2 selector codebooks. Load-side inverse:
+# DFlash2TrainerBackend._CHECKPOINT_KEY_ALIASES — keep the two in sync.
+_DFLASH2_CODEBOOK_WEIGHT_SUFFIXES = (
+    "candidate_selector.predecessor_codebook.weight",
+    "candidate_selector.successor_codebook.weight",
 )
 
 
@@ -849,7 +853,7 @@ def _dflash2_engine_param_name(name: str) -> str:
     single parameter"), so the rename has to happen before the weights reach
     the engine.
     """
-    if _DFLASH2_CODEBOOK_SUFFIX.search(name):
+    if name.endswith(_DFLASH2_CODEBOOK_WEIGHT_SUFFIXES):
         return name[: -len(".weight")]
     return name
 
@@ -913,12 +917,10 @@ def _assert_vllm_supports_dflash2() -> None:
 
 def _dflash2_config_value(config: dict[str, Any], key: str) -> Any:
     """Read a DFlash2 knob from the checkpoint config, top level first."""
-    if key in config:
-        return config[key]
-    nested = config.get("dflash_config")
-    if isinstance(nested, dict):
-        return nested.get(key)
-    return None
+    return _first_present(
+        _get_nested(config, (key,), None),
+        _get_nested(config, ("dflash_config", key), None),
+    )
 
 
 def _validate_vllm_dflash2_block_size(
@@ -966,9 +968,12 @@ def _load_vllm_dflash_drafter_config(spec_model_path: Any) -> dict[str, Any] | N
 
 
 def _validate_vllm_dflash_drafter_config(
-    spec_model_path: Any, algorithm: str = "DFLASH"
+    spec_model_path: Any,
+    algorithm: str = "DFLASH",
+    config: dict[str, Any] | None = None,
 ) -> None:
-    config = _load_vllm_dflash_drafter_config(spec_model_path)
+    if config is None:
+        config = _load_vllm_dflash_drafter_config(spec_model_path)
     if config is None:
         return
     config_path = os.path.join(os.fspath(spec_model_path), "config.json")
@@ -1216,8 +1221,11 @@ def build_vllm_speculative_config_from_drafter(
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
     if method in ("dflash", "dspark"):
+        drafter_checkpoint_config = _load_vllm_dflash_drafter_config(spec_model_path)
         if method == "dflash" or algorithm == "DSPARK":
-            _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=algorithm)
+            _validate_vllm_dflash_drafter_config(
+                spec_model_path, algorithm=algorithm, config=drafter_checkpoint_config
+            )
         num_speculative_tokens = _positive_int_or_none(
             rollout_drafter_cfg.get("spec_verify_tokens")
         )
@@ -1229,7 +1237,7 @@ def build_vllm_speculative_config_from_drafter(
         if algorithm == "DFLASH2":
             _assert_vllm_supports_dflash2()
             _validate_vllm_dflash2_block_size(
-                _load_vllm_dflash_drafter_config(spec_model_path),
+                drafter_checkpoint_config,
                 drafter_cfg,
                 num_speculative_tokens,
             )
