@@ -72,7 +72,10 @@ def _drafter(model_path, **overrides):
         "speculative_algorithm": "DFLASH2",
         "model_path": str(model_path),
         "rollout": {"spec_steps": 1, "spec_topk": 1, "spec_verify_tokens": 8},
-        "training": {"dflash2_block_size": 8, "collect_hidden_states_from_sgl": True},
+        "training": {
+            "dflash2_block_size": 8,
+            "collect_hidden_states_from_old_logprob": True,
+        },
     }
     config.update(overrides)
     return config
@@ -92,7 +95,26 @@ def test_dflash2_maps_to_the_dflash_server_algorithm(
 
     assert overrides["speculative_algorithm"] == "DFLASH"
     assert overrides["speculative_num_draft_tokens"] == 8
-    assert overrides["enable_return_hidden_states"] is True
+    # sglang rejects return_hidden_states for the DFLASH worker; DFlash2 runs
+    # collect hidden states from the old-logprob pass instead.
+    assert overrides["enable_return_hidden_states"] is False
+
+
+def test_dflash2_rejects_engine_hidden_state_collection(
+    tmp_path, sglang_has_dflash2
+) -> None:
+    """sglang rejects return_hidden_states for DFLASH, so fail in the overlay."""
+    with pytest.raises(ValueError, match="collect_hidden_states_from_old_logprob"):
+        _server_args_overrides_from_drafter(
+            _drafter(
+                _write_drafter(tmp_path),
+                training={
+                    "dflash2_block_size": 8,
+                    "collect_hidden_states_from_sgl": True,
+                },
+            ),
+            _SUPPORTED_FIELDS,
+        )
 
 
 def test_dflash2_refuses_an_sglang_without_the_draft_class(

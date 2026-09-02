@@ -985,6 +985,7 @@ def _validate_vllm_dflash_drafter_config(
     spec_model_path: Any,
     algorithm: str = "DFLASH",
     config: dict[str, Any] | None = None,
+    engine: str = "vLLM",
 ) -> None:
     if config is None:
         config = _load_vllm_dflash_drafter_config(spec_model_path)
@@ -1000,7 +1001,7 @@ def _validate_vllm_dflash_drafter_config(
         # checkpoint would load fine and silently serve without them.
         if _DFLASH2_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
             raise ValueError(
-                "vLLM DFLASH2 requires actor_rollout_ref.rollout.drafter.model_path to point "
+                f"{engine} DFLASH2 requires actor_rollout_ref.rollout.drafter.model_path to point "
                 "to a DFlash2 drafter checkpoint with architectures in "
                 f"{sorted(_DFLASH2_SERVABLE_ARCHITECTURES)}; got architectures={architectures!r} "
                 f"from {config_path}. Use speculative_algorithm=DFLASH for a plain DFlash drafter."
@@ -1012,7 +1013,7 @@ def _validate_vllm_dflash_drafter_config(
         ]
         if missing:
             raise ValueError(
-                "vLLM DFLASH2 requires the drafter config.json to carry the DFlash2 "
+                f"{engine} DFLASH2 requires the drafter config.json to carry the DFlash2 "
                 f"hyperparameters {list(_DFLASH2_RUNTIME_KEYS)} (top level or under dflash_config); "
                 f"missing {missing} in {config_path}."
             )
@@ -2500,7 +2501,17 @@ def _ipc_safe_allocator(enabled: bool):
         yield
         return
     set_expandable_segments(False)
-    yield
+    try:
+        yield
+    finally:
+        # Torch has no getter for the live setting, so restore only what the
+        # process explicitly asked for: re-enable expandable segments when
+        # PYTORCH_CUDA_ALLOC_CONF requests them, and otherwise leave them off
+        # (re-enabling unconditionally would poison later allocations in runs
+        # that never turned them on; verl's own per-step sync re-enables them
+        # where it wants them).
+        if "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""):
+            set_expandable_segments(True)
 
 
 async def speco_vllm_update_draft_weights(

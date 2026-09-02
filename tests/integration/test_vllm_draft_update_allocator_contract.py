@@ -38,17 +38,30 @@ def fake_verl_device(monkeypatch):
 
 
 def test_ipc_send_disables_expandable_segments_and_leaves_them_off(
-    fake_verl_device,
+    fake_verl_device, monkeypatch
 ) -> None:
-    """No restore: torch has no getter for the prior state, and re-enabling
-    would poison environments that never turned expandable segments on; verl's
+    """Torch has no getter for the prior state, so nothing is restored unless
+    the process explicitly asked for expandable segments via the env; verl's
     own sync re-enables them per step where it wants them."""
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     with _ipc_safe_allocator(True):
         assert fake_verl_device == [False]
     assert fake_verl_device == [False]
 
 
-def test_ipc_send_keeps_expandable_segments_off_on_failure(fake_verl_device) -> None:
+def test_ipc_send_restores_env_requested_expandable_segments(
+    fake_verl_device, monkeypatch
+) -> None:
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with _ipc_safe_allocator(True):
+        assert fake_verl_device == [False]
+    assert fake_verl_device == [False, True]
+
+
+def test_ipc_send_keeps_expandable_segments_off_on_failure(
+    fake_verl_device, monkeypatch
+) -> None:
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
     with pytest.raises(RuntimeError, match="send failed"):
         with _ipc_safe_allocator(True):
             raise RuntimeError("send failed")

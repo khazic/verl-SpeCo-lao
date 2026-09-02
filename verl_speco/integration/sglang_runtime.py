@@ -32,15 +32,11 @@ import time
 from dataclasses import fields
 from typing import Any, Optional, cast
 
-# The DFlash2 checkpoint contract is engine-agnostic; the helpers live with the
-# vLLM runtime, which never imports this module, so there is no cycle.
-from verl_speco.integration.vllm_runtime import (
-    _dflash2_engine_param_name,
-    _ipc_safe_allocator,
-    _load_vllm_dflash_drafter_config,
-    _resolve_dflash2_block_size,
-    _validate_vllm_dflash_drafter_config,
-)
+# The DFlash2 checkpoint contract and IPC allocator helpers live with the vLLM
+# runtime; they are engine-agnostic, but that module runs import-time patches
+# (transformers constants, NPU import compat), so this module imports them
+# LAZILY at the DFlash2 call sites instead of at module scope: a pure-SGLang
+# process must not pay vllm_runtime's import-time side effects.
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
@@ -670,6 +666,11 @@ def _validate_sglang_dflash2_block_size(
     trained convolutions index a layout they never saw, which reads as a merely
     weak drafter, so refuse it up front.
     """
+    from verl_speco.integration.vllm_runtime import (
+        _load_vllm_dflash_drafter_config,
+        _resolve_dflash2_block_size,
+    )
+
     verify_tokens = _positive_int_or_none(spec_verify_tokens)
     if verify_tokens is None:
         return
@@ -722,7 +723,24 @@ def _server_args_overrides_from_drafter(
         # sglang; no tagged release ships it yet). Map the string here and
         # enforce the checkpoint/engine contract up front, mirroring
         # vllm_runtime.
+        from verl_speco.integration.vllm_runtime import (
+            _load_vllm_dflash_drafter_config,
+            _validate_vllm_dflash_drafter_config,
+        )
+
         _assert_sglang_supports_dflash2()
+        if bool(training_cfg.get("collect_hidden_states_from_sgl")):
+            # sglang main rejects return_hidden_states for the DFLASH worker
+            # ("DFLASH speculative decoding does not support
+            # return_hidden_states yet"), and DFlash2 only exists on sglang
+            # main, so this combination always dies deep inside engine startup.
+            # Fail here with the fix instead.
+            raise ValueError(
+                "DFLASH2 on SGLang cannot collect hidden states from the engine: sglang "
+                "rejects return_hidden_states for the DFLASH worker. Set "
+                "actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=false "
+                "and collect_hidden_states_from_old_logprob=true instead."
+            )
         drafter_checkpoint_config = _load_vllm_dflash_drafter_config(
             drafter_cfg.get("model_path")
         )
@@ -730,6 +748,7 @@ def _server_args_overrides_from_drafter(
             drafter_cfg.get("model_path"),
             algorithm="DFLASH2",
             config=drafter_checkpoint_config,
+            engine="SGLang",
         )
         _validate_sglang_dflash2_block_size(
             drafter_cfg,
@@ -965,6 +984,31 @@ async def _sgl_update_weights_with_route(
     infer_tp_rank = infer_tp_mesh.get_local_rank()
     device_name = get_device_name()
 
+    # Validate the routing contract on EVERY rank before the gather below: a
+    # rank-0-only raise would leave the other ranks blocked in the collective
+    # (an NCCL-watchdog hang instead of the intended fail-loud).
+    struct_fields = getattr(UpdateWeightsFromTensorReqInput, "__struct_fields__", None)
+    if struct_fields is None:
+        # Older sglang builds declare the request as a dataclass.
+        struct_fields = [
+            field.name for field in fields(UpdateWeightsFromTensorReqInput)
+        ]
+    request_fields = frozenset(struct_fields)
+    for field, value in (
+        ("disable_target_model", disable_target_model),
+        ("disable_draft_model", disable_draft_model),
+    ):
+        if value and field not in request_fields and load_format is None:
+            # sglang main made the request a fixed msgspec struct without these
+            # fields; exclusion then routes through the SPECO custom weight
+            # loaders. Without either mechanism a split update would overwrite
+            # the model it was meant to skip, so fail loud on all ranks.
+            raise RuntimeError(
+                f"This sglang build has no UpdateWeightsFromTensorReqInput.{field} "
+                "and ServerArgs.custom_weight_loader is unsupported, so a split "
+                "target/draft weight update cannot be routed; upgrade sglang or verl."
+            )
+
     monkey_patch_torch_reductions()
 
     def _prepare_update_tensor(tensor):
@@ -1014,26 +1058,16 @@ async def _sgl_update_weights_with_route(
         load_format=load_format,
         flush_cache=flush_cache,
     )
-    setattr(update_weights_request, "abort_all_requests", abort_all_requests)
-    if disable_draft_model is not None and hasattr(
-        update_weights_request, "disable_draft_model"
+    # One policy for optional request fields: set what this build's request
+    # carries; anything load-bearing but absent was already rejected on all
+    # ranks before the gather above.
+    for field, value in (
+        ("abort_all_requests", abort_all_requests),
+        ("disable_draft_model", disable_draft_model),
+        ("disable_target_model", disable_target_model),
     ):
-        setattr(update_weights_request, "disable_draft_model", disable_draft_model)
-    if disable_target_model is not None:
-        if hasattr(update_weights_request, "disable_target_model"):
-            setattr(
-                update_weights_request, "disable_target_model", disable_target_model
-            )
-        elif disable_target_model and load_format is None:
-            # sglang main dropped the field (the request is a fixed msgspec
-            # struct); a draft-only update then routes through the SPECO custom
-            # weight loader, which skips the target. Without either mechanism a
-            # draft publish would overwrite the target model, so fail loud.
-            raise RuntimeError(
-                "This sglang build has no UpdateWeightsFromTensorReqInput.disable_target_model "
-                "and ServerArgs.custom_weight_loader is unsupported, so a draft-only weight "
-                "update cannot be routed; upgrade sglang or verl."
-            )
+        if value is not None and field in request_fields:
+            setattr(update_weights_request, field, value)
     result = await engine.update_weights_from_tensor(update_weights_request)
     if isinstance(result, dict):
         success = result.get("success")
@@ -1233,6 +1267,11 @@ async def speco_update_draft_weights(
         # trainer while SGLang's draft holds them as bare parameters; SGLang's
         # load_weights silently drops unresolved names, so rename here (the
         # SGLang publish path otherwise forwards trainer names verbatim).
+        from verl_speco.integration.vllm_runtime import (
+            _dflash2_engine_param_name,
+            _ipc_safe_allocator,
+        )
+
         # The rename only rewrites the two DFlash2 codebook suffixes, so it is a
         # no-op for every other drafter family.
         named_weights = (
