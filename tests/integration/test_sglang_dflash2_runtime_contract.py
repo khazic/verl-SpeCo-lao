@@ -25,7 +25,7 @@ from verl_speco.integration import sglang_runtime
 from verl_speco.integration.sglang_runtime import (
     _assert_sglang_supports_dflash2,
     _drafter_uses_dflash_aux_hidden,
-    _is_sglang_eagle_draft_model,
+    _is_sglang_draft_model,
     _server_args_overrides_from_drafter,
     _validate_sglang_dflash2_block_size,
 )
@@ -215,7 +215,7 @@ def test_draft_model_detection_covers_the_dflash_family() -> None:
     class Qwen3ForCausalLM:
         config = _FakeConfig(architectures=["Qwen3ForCausalLM"])
 
-    assert _is_sglang_eagle_draft_model(DFlash2DraftModel())
-    assert _is_sglang_eagle_draft_model(DFlashDraftModel())
-    assert _is_sglang_eagle_draft_model(EagleDraft())
-    assert not _is_sglang_eagle_draft_model(Qwen3ForCausalLM())
+    assert _is_sglang_draft_model(DFlash2DraftModel())
+    assert _is_sglang_draft_model(DFlashDraftModel())
+    assert _is_sglang_draft_model(EagleDraft())
+    assert not _is_sglang_draft_model(Qwen3ForCausalLM())

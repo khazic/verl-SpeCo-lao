@@ -22,6 +22,7 @@ actors that own the HTTP server and rollout adapter.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import inspect
 import json
@@ -34,10 +35,10 @@ from typing import Any, Optional, cast
 # The DFlash2 checkpoint contract is engine-agnostic; the helpers live with the
 # vLLM runtime, which never imports this module, so there is no cycle.
 from verl_speco.integration.vllm_runtime import (
-    _dflash2_config_value,
     _dflash2_engine_param_name,
     _ipc_safe_allocator,
     _load_vllm_dflash_drafter_config,
+    _resolve_dflash2_block_size,
     _validate_vllm_dflash_drafter_config,
 )
 from verl_speco.integration.sglang_adapter import (
@@ -622,10 +623,6 @@ def _select_target_logprobs_by_raw_positions(
     )
 
 
-def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
-    return str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
-
-
 # SGLang module that carries the DFlash draft classes; the DFlash2 draft
 # (dynamic convolutions + candidate selector, dispatched from the
 # ``DFlash2DraftModel`` architecture) exists only on sglang main so far, so its
@@ -635,7 +632,6 @@ _SGLANG_DFLASH_MODULE = "sglang.srt.models.dflash"
 
 def _sglang_supports_dflash2() -> bool | None:
     """Whether the installed sglang ships the DFlash2 draft; ``None`` without sglang."""
-    import importlib
     import importlib.util
 
     try:
@@ -661,7 +657,9 @@ def _assert_sglang_supports_dflash2() -> None:
 
 
 def _validate_sglang_dflash2_block_size(
-    drafter_cfg: dict[str, Any], spec_verify_tokens: Any
+    drafter_cfg: dict[str, Any],
+    spec_verify_tokens: Any,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """Pin the DFlash2 block to SGLang's ``speculative_num_draft_tokens``.
 
@@ -675,14 +673,9 @@ def _validate_sglang_dflash2_block_size(
     verify_tokens = _positive_int_or_none(spec_verify_tokens)
     if verify_tokens is None:
         return
-    training_cfg = drafter_cfg.get("training") or {}
-    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
-    if block_size is None:
+    if config is None:
         config = _load_vllm_dflash_drafter_config(drafter_cfg.get("model_path"))
-        if config is not None:
-            block_size = _positive_int_or_none(
-                _dflash2_config_value(config, "block_size")
-            )
+    block_size = _resolve_dflash2_block_size(drafter_cfg, config)
     if block_size is None:
         return
     if int(verify_tokens) != int(block_size):
@@ -730,11 +723,18 @@ def _server_args_overrides_from_drafter(
         # enforce the checkpoint/engine contract up front, mirroring
         # vllm_runtime.
         _assert_sglang_supports_dflash2()
+        drafter_checkpoint_config = _load_vllm_dflash_drafter_config(
+            drafter_cfg.get("model_path")
+        )
         _validate_vllm_dflash_drafter_config(
-            drafter_cfg.get("model_path"), algorithm="DFLASH2"
+            drafter_cfg.get("model_path"),
+            algorithm="DFLASH2",
+            config=drafter_checkpoint_config,
         )
         _validate_sglang_dflash2_block_size(
-            drafter_cfg, rollout_cfg.get("spec_verify_tokens")
+            drafter_cfg,
+            rollout_cfg.get("spec_verify_tokens"),
+            config=drafter_checkpoint_config,
         )
         server_algorithm = "DFLASH"
 
@@ -888,24 +888,21 @@ def install_sglang_server_actor_runtime() -> dict[str, Any]:
     return drafter_cfg
 
 
-def _is_sglang_eagle_draft_model(model) -> bool:
+def _is_sglang_draft_model(model) -> bool:
     """Whether ``model`` is the speculative draft (vs the target) in SGLang.
 
-    Despite the name this covers the DFlash family too: SGLang's DFlash/DFlash2
-    draft classes spell neither "eagle" nor ``draft_vocab_size``, so without the
-    "dflash" checks the draft weight loader silently dropped every published
-    DFlash-family tensor while the target loader loaded into the draft.
+    SGLang's DFlash/DFlash2 draft classes spell neither "eagle" nor
+    ``draft_vocab_size``, so without the "dflash" token the draft weight loader
+    silently dropped every published DFlash-family tensor while the target
+    loader loaded into the draft.
     """
     config = getattr(model, "config", None)
-    class_name = type(model).__name__.lower()
-    architectures = getattr(config, "architectures", None) or []
+    names = [type(model).__name__, *(getattr(config, "architectures", None) or [])]
     return (
-        "eagle" in class_name
-        or "dflash" in class_name
-        or any(
-            "eagle" in str(architecture).lower()
-            or "dflash" in str(architecture).lower()
-            for architecture in architectures
+        any(
+            token in str(name).lower()
+            for name in names
+            for token in ("eagle", "dflash")
         )
         or getattr(config, "draft_vocab_size", None) is not None
     )
@@ -914,7 +911,7 @@ def _is_sglang_eagle_draft_model(model) -> bool:
 def speco_sglang_target_weight_loader(model, named_tensors):
     """Load target weights without touching the SGLang draft model."""
 
-    if _is_sglang_eagle_draft_model(model):
+    if _is_sglang_draft_model(model):
         return
     return model.load_weights(named_tensors)
 
@@ -922,9 +919,22 @@ def speco_sglang_target_weight_loader(model, named_tensors):
 def speco_sglang_draft_weight_loader(model, named_tensors):
     """Load draft weights without touching the SGLang target model."""
 
-    if not _is_sglang_eagle_draft_model(model):
+    if not _is_sglang_draft_model(model):
         return
     return model.load_weights(named_tensors)
+
+
+@functools.lru_cache(maxsize=1)
+def _local_serialized_tensor_cls():
+    """Resolve sglang's LocalSerializedTensor once (it runs per publish bucket)."""
+    try:
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+    except ImportError:
+        # sglang main moved it out of model_runner.
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            LocalSerializedTensor,
+        )
+    return LocalSerializedTensor
 
 
 async def _sgl_update_weights_with_route(
@@ -944,13 +954,7 @@ async def _sgl_update_weights_with_route(
     import torch.distributed as dist
     from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
-    try:
-        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-    except ImportError:
-        # sglang main moved it out of model_runner.
-        from sglang.srt.model_executor.model_runner_components.weight_updater import (
-            LocalSerializedTensor,
-        )
+    LocalSerializedTensor = _local_serialized_tensor_cls()
     from sglang.srt.utils import MultiprocessingSerializer
     from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
     from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
@@ -977,14 +981,10 @@ async def _sgl_update_weights_with_route(
             )
         return _preprocess_tensor_for_update_weights(tensor)
 
-    # Stage and serialize in non-expandable CUDA segments: tensors shared over
-    # IPC out of an expandable segment need pidfd_getfd (Linux >= 5.6) on the
-    # receiving SGLang worker, exactly like the vLLM bucketed send.
-    with _ipc_safe_allocator(True):
-        named_tensors_batch = [
-            (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
-            for name, tensor in params_batch
-        ]
+    named_tensors_batch = [
+        (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
+        for name, tensor in params_batch
+    ]
     gathered_serialized_batches = (
         [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
     )
@@ -1233,32 +1233,36 @@ async def speco_update_draft_weights(
         # trainer while SGLang's draft holds them as bare parameters; SGLang's
         # load_weights silently drops unresolved names, so rename here (the
         # SGLang publish path otherwise forwards trainer names verbatim).
-        named_weights = weights.items()
-        if _drafter_algorithm(drafter_cfg) == "DFLASH2":
-            named_weights = (
-                (_dflash2_engine_param_name(name), tensor)
-                for name, tensor in named_weights
-            )
+        # The rename only rewrites the two DFlash2 codebook suffixes, so it is a
+        # no-op for every other drafter family.
+        named_weights = (
+            (_dflash2_engine_param_name(name), tensor)
+            for name, tensor in weights.items()
+        )
 
         bucket_idx = 0
-        async for params_batch in get_named_tensor_buckets(
-            named_weights, update_weights_bucket_bytes
-        ):
-            bucket_idx += 1
-            await _sgl_update_weights_with_route(
-                engine=self._engine,
-                params_batch=list(params_batch),
-                device_mesh_key="infer_tp",
-                device_mesh=self.device_mesh,
-                disable_draft_model=False,
-                disable_target_model=True,
-                load_format=SPECO_DRAFT_WEIGHT_LOADER
-                if _supports_sglang_custom_weight_loader()
-                else None,
-                stage_cpu_tensors_to_device=True,
-                flush_cache=bool(flush_after and not engine_has_flush_cache),
-                abort_all_requests=False,
-            )
+        # Stage and serialize in non-expandable CUDA segments: tensors shared
+        # over IPC out of an expandable segment need pidfd_getfd (Linux >= 5.6)
+        # on the receiving SGLang worker, exactly like the vLLM bucketed send.
+        with _ipc_safe_allocator(True):
+            async for params_batch in get_named_tensor_buckets(
+                named_weights, update_weights_bucket_bytes
+            ):
+                bucket_idx += 1
+                await _sgl_update_weights_with_route(
+                    engine=self._engine,
+                    params_batch=list(params_batch),
+                    device_mesh_key="infer_tp",
+                    device_mesh=self.device_mesh,
+                    disable_draft_model=False,
+                    disable_target_model=True,
+                    load_format=SPECO_DRAFT_WEIGHT_LOADER
+                    if _supports_sglang_custom_weight_loader()
+                    else None,
+                    stage_cpu_tensors_to_device=True,
+                    flush_cache=bool(flush_after and not engine_has_flush_cache),
+                    abort_all_requests=False,
+                )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             if flush_after and engine_has_flush_cache:

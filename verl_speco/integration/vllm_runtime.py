@@ -923,6 +923,23 @@ def _dflash2_config_value(config: dict[str, Any], key: str) -> Any:
     )
 
 
+def _resolve_dflash2_block_size(
+    drafter_cfg: dict[str, Any], config: dict[str, Any] | None
+) -> int | None:
+    """The trained DFlash2 conv block size.
+
+    ``drafter.training.dflash2_block_size`` wins over the checkpoint's
+    ``dflash_config`` (the trainer pins its convolutions to the former); both
+    the vLLM and the SGLang block-size validators resolve through here so the
+    precedence cannot drift between engines.
+    """
+    training_cfg = drafter_cfg.get("training") or {}
+    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
+    if block_size is None and config is not None:
+        block_size = _positive_int_or_none(_dflash2_config_value(config, "block_size"))
+    return block_size
+
+
 def _validate_vllm_dflash2_block_size(
     config: dict[str, Any] | None,
     drafter_cfg: dict[str, Any],
@@ -937,10 +954,7 @@ def _validate_vllm_dflash2_block_size(
     (or vice versa), which shows up as a silently weak drafter rather than an
     error, so refuse the mismatch here.
     """
-    training_cfg = drafter_cfg.get("training") or {}
-    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
-    if block_size is None and config is not None:
-        block_size = _positive_int_or_none(_dflash2_config_value(config, "block_size"))
+    block_size = _resolve_dflash2_block_size(drafter_cfg, config)
     if block_size is None:
         return
     if int(num_speculative_tokens) + 1 != int(block_size):
