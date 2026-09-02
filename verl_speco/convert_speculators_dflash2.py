@@ -151,10 +151,13 @@ def convert_speculators_dflash2_config(
         if transformer.get(key) is not None:
             converted[key] = transformer[key]
     rope_parameters = transformer.get("rope_parameters")
-    if isinstance(rope_parameters, dict) and "rope_theta" not in converted:
-        # transformers < 5 reads rope_theta at the top level.
-        if rope_parameters.get("rope_theta") is not None:
-            converted["rope_theta"] = rope_parameters["rope_theta"]
+    # transformers < 5 reads rope_theta at the top level.
+    if (
+        "rope_theta" not in converted
+        and isinstance(rope_parameters, dict)
+        and rope_parameters.get("rope_theta") is not None
+    ):
+        converted["rope_theta"] = rope_parameters["rope_theta"]
     if keep_sliding_window:
         for key in _SLIDING_WINDOW_KEYS:
             if key in transformer:
