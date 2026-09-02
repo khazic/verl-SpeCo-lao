@@ -1010,10 +1010,25 @@ async def _sgl_update_weights_with_route(
         flush_cache=flush_cache,
     )
     setattr(update_weights_request, "abort_all_requests", abort_all_requests)
-    if disable_draft_model is not None:
+    if disable_draft_model is not None and hasattr(
+        update_weights_request, "disable_draft_model"
+    ):
         setattr(update_weights_request, "disable_draft_model", disable_draft_model)
     if disable_target_model is not None:
-        setattr(update_weights_request, "disable_target_model", disable_target_model)
+        if hasattr(update_weights_request, "disable_target_model"):
+            setattr(
+                update_weights_request, "disable_target_model", disable_target_model
+            )
+        elif disable_target_model and load_format is None:
+            # sglang main dropped the field (the request is a fixed msgspec
+            # struct); a draft-only update then routes through the SPECO custom
+            # weight loader, which skips the target. Without either mechanism a
+            # draft publish would overwrite the target model, so fail loud.
+            raise RuntimeError(
+                "This sglang build has no UpdateWeightsFromTensorReqInput.disable_target_model "
+                "and ServerArgs.custom_weight_loader is unsupported, so a draft-only weight "
+                "update cannot be routed; upgrade sglang or verl."
+            )
     result = await engine.update_weights_from_tensor(update_weights_request)
     if isinstance(result, dict):
         success = result.get("success")
