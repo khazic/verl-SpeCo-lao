@@ -942,7 +942,14 @@ async def _sgl_update_weights_with_route(
     import torch
     import torch.distributed as dist
     from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
-    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+
+    try:
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+    except ImportError:
+        # sglang main moved it out of model_runner.
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            LocalSerializedTensor,
+        )
     from sglang.srt.utils import MultiprocessingSerializer
     from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
     from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
