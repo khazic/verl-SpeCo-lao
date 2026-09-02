@@ -2466,14 +2466,16 @@ def _ipc_safe_allocator(enabled: bool):
 
     CUDA tensors shared over IPC out of an expandable segment carry an fd-based
     handle that the receiver can only import through ``pidfd_getfd`` (Linux >=
-    5.6); on older kernels the vLLM worker fails the whole draft update with
+    5.6); on older kernels the rollout worker fails the whole draft update with
     "does not support the pidfd_getfd syscall". verl's own actor->rollout sync
-    flips expandable segments off around its send for the same reason and turns
-    them back on afterwards, so the draft publish mirrors that. Restoring
-    ``True`` unconditionally (torch has no public getter for the prior state)
-    matches the state verl's own per-step sync leaves behind on every verl that
-    ships the helper; a verl without it never enabled expandable segments, and
-    the ImportError guard then leaves the allocator untouched.
+    flips expandable segments off around its send for the same reason. Torch has
+    no public getter for the prior state, so this guard deliberately leaves them
+    OFF instead of guessing: turning them on after the send would poison later
+    allocations in environments that never enabled them (e.g.
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False``), while verl's own
+    sync re-enables them at the end of every step on the verl versions that use
+    them at all. A verl without the helper never enabled expandable segments,
+    and the ImportError guard then leaves the allocator untouched.
     """
     if not enabled:
         yield
@@ -2484,10 +2486,7 @@ def _ipc_safe_allocator(enabled: bool):
         yield
         return
     set_expandable_segments(False)
-    try:
-        yield
-    finally:
-        set_expandable_segments(True)
+    yield
 
 
 async def speco_vllm_update_draft_weights(

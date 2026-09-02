@@ -37,19 +37,22 @@ def fake_verl_device(monkeypatch):
     return calls
 
 
-def test_ipc_send_disables_expandable_segments_and_restores_them(
+def test_ipc_send_disables_expandable_segments_and_leaves_them_off(
     fake_verl_device,
 ) -> None:
+    """No restore: torch has no getter for the prior state, and re-enabling
+    would poison environments that never turned expandable segments on; verl's
+    own sync re-enables them per step where it wants them."""
     with _ipc_safe_allocator(True):
         assert fake_verl_device == [False]
-    assert fake_verl_device == [False, True]
+    assert fake_verl_device == [False]
 
 
-def test_ipc_send_restores_expandable_segments_on_failure(fake_verl_device) -> None:
+def test_ipc_send_keeps_expandable_segments_off_on_failure(fake_verl_device) -> None:
     with pytest.raises(RuntimeError, match="send failed"):
         with _ipc_safe_allocator(True):
             raise RuntimeError("send failed")
-    assert fake_verl_device == [False, True]
+    assert fake_verl_device == [False]
 
 
 def test_shm_transport_leaves_the_allocator_alone(fake_verl_device) -> None:
