@@ -72,7 +72,6 @@ done
 # The example owns the collect-to-train algorithm pairing; the runner only needs
 # the collect side of it to pick the matching cached draft model.
 separate_training="false"
-spec_verify_tokens_default="4"
 
 case "${drafter}" in
   eagle3|megatron-eagle3)
@@ -90,9 +89,6 @@ case "${drafter}" in
   dflash2)
     draft_model="${SPECO_DFLASH2_DRAFT_MODEL:-}"
     draft_algorithm="DFLASH2"
-    # vLLM sizes the DFlash2 convolution block as 1 + spec_verify_tokens, and
-    # the trainer folds by dflash2_block_size (default 8), so the two must agree.
-    spec_verify_tokens_default="7"
     ;;
   peagle)
     draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
@@ -197,7 +193,7 @@ overrides=(
   "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${SPECO_REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
   "actor_rollout_ref.rollout.drafter.rollout.spec_steps=${SPECO_SPEC_STEPS:-3}"
   "actor_rollout_ref.rollout.drafter.rollout.spec_topk=${SPECO_SPEC_TOPK:-1}"
-  "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_SPEC_VERIFY_TOKENS:-${spec_verify_tokens_default}}"
+  "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_SPEC_VERIFY_TOKENS:-4}"
   "actor_rollout_ref.rollout.drafter.training.step=${SPECO_DRAFTER_TRAINING_STEPS:-1}"
   "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=${SPECO_DRAFTER_BATCH_SIZE_PER_GPU:-1}"
   "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=${SPECO_COLLECT_INTERVAL_STEPS:-1}"
@@ -241,6 +237,9 @@ fi
 
 if [[ "${drafter}" == "dflash2" ]]; then
   overrides+=(
+    # vLLM sizes the DFlash2 convolution block as 1 + spec_verify_tokens, and
+    # the trainer folds by dflash2_block_size (default 8), so the two must agree.
+    "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_DFLASH2_SPEC_VERIFY_TOKENS:-7}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_block_size=${SPECO_DFLASH2_BLOCK_SIZE:-8}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_num_anchors=${SPECO_DFLASH2_NUM_ANCHORS:-8}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_loss_decay_gamma=${SPECO_DFLASH2_LOSS_DECAY_GAMMA:-7}"
