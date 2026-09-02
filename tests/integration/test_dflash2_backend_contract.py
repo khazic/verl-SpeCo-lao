@@ -781,7 +781,10 @@ def test_dflash2_maps_to_the_vllm_dflash_method() -> None:
     """vLLM serves DFlash2 through its DFlash proposer, dispatching on the architecture."""
     from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
 
-    assert _speculative_method_from_drafter({"speculative_algorithm": "DFLASH2"}) == "dflash"
+    assert (
+        _speculative_method_from_drafter({"speculative_algorithm": "DFLASH2"})
+        == "dflash"
+    )
 
 
 def test_dflash2_config_serializes_the_runtime_dflash_config_block() -> None:
@@ -820,23 +823,28 @@ def test_dflash2_config_serializes_the_runtime_dflash_config_block() -> None:
     assert reloaded.block_size == 4
 
 
-def test_dflash2_rejected_by_sglang_config_builder() -> None:
-    from verl_speco.integration.sglang_runtime import (
-        _server_args_overrides_from_drafter,
+def test_dflash2_maps_to_the_sglang_dflash_algorithm(monkeypatch) -> None:
+    """SGLang serves DFlash2 through the DFLASH worker, dispatching on the architecture."""
+    from verl_speco.integration import sglang_runtime
+
+    monkeypatch.setattr(sglang_runtime, "_sglang_supports_dflash2", lambda: True)
+    overrides = sglang_runtime._server_args_overrides_from_drafter(
+        {
+            "enable": True,
+            "speculative_algorithm": "DFLASH2",
+            "rollout": {"spec_verify_tokens": 8},
+            "training": {"dflash2_block_size": 8},
+        },
+        supported_fields={"speculative_algorithm"},
     )
-
-    with pytest.raises(ValueError, match="not an engine-level speculative algorithm"):
-        _server_args_overrides_from_drafter(
-            {"enable": True, "speculative_algorithm": "DFLASH2"},
-            supported_fields={"speculative_algorithm"},
-        )
+    assert overrides["speculative_algorithm"] == "DFLASH"
 
 
-def test_dflash2_never_reaches_the_sglang_aux_hidden_path() -> None:
-    """The engine rejects DFLASH2 under the same ``enable`` this helper requires."""
+def test_dflash2_reaches_the_sglang_aux_hidden_path() -> None:
+    """DFlash2 consumes the same concatenated target-layer hidden states as DFlash."""
     from verl_speco.integration.sglang_runtime import _drafter_uses_dflash_aux_hidden
 
-    assert not _drafter_uses_dflash_aux_hidden(
+    assert _drafter_uses_dflash_aux_hidden(
         {
             "enable": True,
             "enable_drafter_training": True,

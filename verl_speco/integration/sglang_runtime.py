@@ -31,6 +31,14 @@ import time
 from dataclasses import fields
 from typing import Any, Optional, cast
 
+# The DFlash2 checkpoint contract is engine-agnostic; the helpers live with the
+# vLLM runtime, which never imports this module, so there is no cycle.
+from verl_speco.integration.vllm_runtime import (
+    _dflash2_config_value,
+    _dflash2_engine_param_name,
+    _load_vllm_dflash_drafter_config,
+    _validate_vllm_dflash_drafter_config,
+)
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
@@ -203,11 +211,11 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg: dict[str, Any]) -> bool:
     algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
     training_cfg = drafter_cfg.get("training") or {}
     return bool(
-        # DFLASH2, like DOMINO, never reaches this path: it is not an
-        # engine-level algorithm, so the ServerArgs override below fails loud
-        # for it under the same ``enable`` this check requires. A trained
-        # DFlash2 checkpoint is served as DFLASH.
-        algorithm in {"DFLASH", "DSPARK"}
+        # DFlash2 keeps the DFlash aux-hidden layout: the ServerArgs override
+        # maps DFLASH2 onto the DFLASH speculative worker, and the collection
+        # side consumes the same concatenated target-layer hidden states.
+        # DOMINO still never reaches this path (its override fails loud).
+        algorithm in {"DFLASH", "DFLASH2", "DSPARK"}
         and drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
         and training_cfg.get("collect_hidden_states_from_sgl")
@@ -613,6 +621,79 @@ def _select_target_logprobs_by_raw_positions(
     )
 
 
+def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
+    return str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
+
+
+# SGLang module that carries the DFlash draft classes; the DFlash2 draft
+# (dynamic convolutions + candidate selector, dispatched from the
+# ``DFlash2DraftModel`` architecture) exists only on sglang main so far, so its
+# presence is probed on the class, not the module.
+_SGLANG_DFLASH_MODULE = "sglang.srt.models.dflash"
+
+
+def _sglang_supports_dflash2() -> bool | None:
+    """Whether the installed sglang ships the DFlash2 draft; ``None`` without sglang."""
+    import importlib
+    import importlib.util
+
+    try:
+        if importlib.util.find_spec("sglang") is None:
+            return None
+    except (ImportError, ValueError):
+        return None
+    try:
+        module = importlib.import_module(_SGLANG_DFLASH_MODULE)
+    except ImportError:
+        return False
+    return hasattr(module, "DFlash2DraftModel")
+
+
+def _assert_sglang_supports_dflash2() -> None:
+    if _sglang_supports_dflash2() is False:
+        raise ValueError(
+            "DFLASH2 rollout needs an sglang that ships the DFlash2 draft model "
+            f"({_SGLANG_DFLASH_MODULE}.DFlash2DraftModel; on sglang main, not in any "
+            "tagged release up to 0.5.18). Upgrade sglang, or keep "
+            "actor_rollout_ref.rollout.drafter.enable=false and train the DFlash2 drafter offline."
+        )
+
+
+def _validate_sglang_dflash2_block_size(
+    drafter_cfg: dict[str, Any], spec_verify_tokens: Any
+) -> None:
+    """Pin the DFlash2 block to SGLang's ``speculative_num_draft_tokens``.
+
+    Unlike vLLM (block = bonus token + ``num_speculative_tokens``), SGLang's
+    DFLASH worker uses ``speculative_num_draft_tokens`` directly as the block
+    size (``--speculative-dflash-block-size`` is an alias of it) and only logs a
+    warning when it disagrees with the checkpoint. A mismatched block makes the
+    trained convolutions index a layout they never saw, which reads as a merely
+    weak drafter, so refuse it up front.
+    """
+    verify_tokens = _positive_int_or_none(spec_verify_tokens)
+    if verify_tokens is None:
+        return
+    training_cfg = drafter_cfg.get("training") or {}
+    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
+    if block_size is None:
+        config = _load_vllm_dflash_drafter_config(drafter_cfg.get("model_path"))
+        if config is not None:
+            block_size = _positive_int_or_none(
+                _dflash2_config_value(config, "block_size")
+            )
+    if block_size is None:
+        return
+    if int(verify_tokens) != int(block_size):
+        raise ValueError(
+            "DFLASH2 rollout on SGLang requires actor_rollout_ref.rollout.drafter.rollout."
+            "spec_verify_tokens == block_size, since SGLang uses speculative_num_draft_tokens "
+            f"as the DFlash block size: got spec_verify_tokens={verify_tokens} but "
+            f"block_size={block_size} (from drafter.training.dflash2_block_size or the "
+            "checkpoint's dflash_config)."
+        )
+
+
 def _server_args_overrides_from_drafter(
     drafter_cfg: dict[str, Any], supported_fields: set[str]
 ) -> dict[str, Any]:
@@ -636,27 +717,28 @@ def _server_args_overrides_from_drafter(
             "enables the Domino correction head on engines that support it, keeping DOMINO for "
             "drafter training."
         )
-    if algorithm == "DFLASH2":
-        # Same story as Domino: DFlash2 is a DFlash variant whose extra modules
-        # (dynamic convolutions + candidate selector) ride in the checkpoint's
-        # dflash_config, not a distinct engine-level method. DFLASH2 is never a
-        # valid SGLang ServerArgs algorithm, so fail loud instead of forwarding
-        # the raw string. The vLLM overlay maps DFLASH2 onto its DFlash path
-        # (vllm_runtime._speculative_method_from_drafter); the SGLang co-train
-        # path is not validated for DFlash2 yet.
-        raise ValueError(
-            "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
-            "checkpoint. SGLang co-training of a DFlash2 drafter is not wired in this overlay: use "
-            "actor_rollout_ref.rollout.name=vllm (vLLM >= 0.28.0) for DFLASH2 co-training, or set "
-            "actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
-            "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
-            "convolution and selector hyperparameters."
-        )
-
     rollout_cfg = drafter_cfg.get("rollout") or {}
     training_cfg = drafter_cfg.get("training") or {}
+    server_algorithm = drafter_cfg.get("speculative_algorithm")
+    if algorithm == "DFLASH2":
+        # DFlash2 is a DFlash variant, not a ServerArgs algorithm: SGLang runs
+        # it through the DFLASH speculative worker and builds the dynamic
+        # convolutions and the candidate selector from the checkpoint's
+        # ``DFlash2DraftModel`` architecture and ``dflash_config`` (main-branch
+        # sglang; no tagged release ships it yet). Map the string here and
+        # enforce the checkpoint/engine contract up front, mirroring
+        # vllm_runtime.
+        _assert_sglang_supports_dflash2()
+        _validate_vllm_dflash_drafter_config(
+            drafter_cfg.get("model_path"), algorithm="DFLASH2"
+        )
+        _validate_sglang_dflash2_block_size(
+            drafter_cfg, rollout_cfg.get("spec_verify_tokens")
+        )
+        server_algorithm = "DFLASH"
+
     overrides = {
-        "speculative_algorithm": drafter_cfg.get("speculative_algorithm"),
+        "speculative_algorithm": server_algorithm,
         "speculative_draft_model_path": drafter_cfg.get("model_path"),
         "speculative_num_steps": rollout_cfg.get("spec_steps"),
         "speculative_eagle_topk": rollout_cfg.get("spec_topk"),
@@ -806,12 +888,24 @@ def install_sglang_server_actor_runtime() -> dict[str, Any]:
 
 
 def _is_sglang_eagle_draft_model(model) -> bool:
+    """Whether ``model`` is the speculative draft (vs the target) in SGLang.
+
+    Despite the name this covers the DFlash family too: SGLang's DFlash/DFlash2
+    draft classes spell neither "eagle" nor ``draft_vocab_size``, so without the
+    "dflash" checks the draft weight loader silently dropped every published
+    DFlash-family tensor while the target loader loaded into the draft.
+    """
     config = getattr(model, "config", None)
     class_name = type(model).__name__.lower()
     architectures = getattr(config, "architectures", None) or []
     return (
         "eagle" in class_name
-        or any("eagle" in str(architecture).lower() for architecture in architectures)
+        or "dflash" in class_name
+        or any(
+            "eagle" in str(architecture).lower()
+            or "dflash" in str(architecture).lower()
+            for architecture in architectures
+        )
         or getattr(config, "draft_vocab_size", None) is not None
     )
 
@@ -1108,9 +1202,20 @@ async def speco_update_draft_weights(
             if flush_before and engine_has_flush_cache:
                 await _maybe_call_sglang_engine_method(self._engine, "flush_cache")
 
+        # DFlash2 keeps the selector codebooks in nn.Embedding modules on the
+        # trainer while SGLang's draft holds them as bare parameters; SGLang's
+        # load_weights silently drops unresolved names, so rename here (the
+        # SGLang publish path otherwise forwards trainer names verbatim).
+        named_weights = weights.items()
+        if _drafter_algorithm(drafter_cfg) == "DFLASH2":
+            named_weights = (
+                (_dflash2_engine_param_name(name), tensor)
+                for name, tensor in named_weights
+            )
+
         bucket_idx = 0
         async for params_batch in get_named_tensor_buckets(
-            weights.items(), update_weights_bucket_bytes
+            named_weights, update_weights_bucket_bytes
         ):
             bucket_idx += 1
             await _sgl_update_weights_with_route(
