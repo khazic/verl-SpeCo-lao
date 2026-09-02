@@ -122,7 +122,11 @@ This needs an sglang build from main (no tagged release up to 0.5.18 ships the
 DFlash2 draft). Note the block contract differs from vLLM: SGLang uses
 `spec_verify_tokens` directly as the DFlash block size, so set
 `spec_verify_tokens = dflash2_block_size` (8 by default; see
-`examples/run_qwen3-8b_drafter_dflash2_sglang.sh`).
+`examples/run_qwen3-8b_drafter_dflash2_sglang.sh`). sglang main also rejects
+`return_hidden_states` for the DFLASH worker, so collect the training hidden
+states from the old-logprob pass
+(`training.collect_hidden_states_from_old_logprob=true`) rather than
+`collect_hidden_states_from_sgl`.
 
 For vLLM DSpark on GPU, use vLLM main. For vLLM DSpark on NPU, follow the
 version pairing documented by

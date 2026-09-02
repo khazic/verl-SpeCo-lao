@@ -10,6 +10,10 @@ set -x
 # SGLang uses spec_verify_tokens directly as the DFlash block size (unlike
 # vLLM's bonus-token-plus-tokens), so spec_verify_tokens must equal
 # dflash2_block_size (8 -> 8 below).
+# Hidden states are collected on the trainer's old-logprob pass: sglang main
+# rejects return_hidden_states for the DFLASH worker
+# (sglang.srt.speculative.dflash_utils), so collect_hidden_states_from_sgl
+# cannot be used with the DFlash family there.
 project_name='verl_grpo_example_dflash2_drafter'
 exp_name='qwen3_8b_dflash2_drafter_sglang'
 
@@ -67,7 +71,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH2 \
-    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=True \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
+    actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.use_logits=False \
     actor_rollout_ref.rollout.drafter.training.dflash2_block_size=8 \
     actor_rollout_ref.rollout.drafter.training.dflash2_num_anchors=64 \
