@@ -2469,8 +2469,11 @@ def _ipc_safe_allocator(enabled: bool):
     5.6); on older kernels the vLLM worker fails the whole draft update with
     "does not support the pidfd_getfd syscall". verl's own actor->rollout sync
     flips expandable segments off around its send for the same reason and turns
-    them back on afterwards, so the draft publish mirrors that. A verl without
-    the helper never enabled expandable segments, so there is nothing to do.
+    them back on afterwards, so the draft publish mirrors that. Restoring
+    ``True`` unconditionally (torch has no public getter for the prior state)
+    matches the state verl's own per-step sync leaves behind on every verl that
+    ships the helper; a verl without it never enabled expandable segments, and
+    the ImportError guard then leaves the allocator untouched.
     """
     if not enabled:
         yield
