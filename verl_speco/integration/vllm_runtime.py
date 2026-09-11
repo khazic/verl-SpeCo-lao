@@ -851,7 +851,7 @@ def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
 
 # Draft architectures vLLM can serve through its DFlash speculative path.
 # Keep in sync with the alias sets in verl_speco/models/auto.py.
-_DFLASH2_SERVABLE_ARCHITECTURES = frozenset({"DFlash2DraftModel", "Qwen3DFlash2Model"})
+_DFLASH2_SERVABLE_ARCHITECTURES = frozenset({"DFlash2DraftModel"})
 _DFLASH_SERVABLE_ARCHITECTURES = frozenset(
     {"DFlashDraftModel", *_DFLASH2_SERVABLE_ARCHITECTURES}
 )
