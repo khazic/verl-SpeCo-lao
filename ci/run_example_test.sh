@@ -27,6 +27,9 @@ case "${platform}/${backend}/${drafter}" in
   gpu/sglang/dflash)
     example="examples/run_qwen3-8b_drafter_dflash_sglang.sh"
     ;;
+  gpu/sglang/dflash2)
+    example="examples/run_qwen3-8b_drafter_dflash2_sglang.sh"
+    ;;
   npu/vllm/eagle3)
     example="examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh"
     ;;
@@ -236,10 +239,16 @@ if [[ "${drafter}" == "dflash" ]]; then
 fi
 
 if [[ "${drafter}" == "dflash2" ]]; then
+  # The engines size the DFlash2 convolution block differently: vLLM uses the
+  # bonus token plus spec_verify_tokens (block 8 -> 7), SGLang uses
+  # speculative_num_draft_tokens directly as the block size (block 8 -> 8).
+  # The trainer folds by dflash2_block_size (default 8), so they must agree.
+  dflash2_spec_verify_tokens_default="7"
+  if [[ "${backend}" == "sglang" ]]; then
+    dflash2_spec_verify_tokens_default="8"
+  fi
   overrides+=(
-    # vLLM sizes the DFlash2 convolution block as 1 + spec_verify_tokens, and
-    # the trainer folds by dflash2_block_size (default 8), so the two must agree.
-    "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_DFLASH2_SPEC_VERIFY_TOKENS:-7}"
+    "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_DFLASH2_SPEC_VERIFY_TOKENS:-${dflash2_spec_verify_tokens_default}}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_block_size=${SPECO_DFLASH2_BLOCK_SIZE:-8}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_num_anchors=${SPECO_DFLASH2_NUM_ANCHORS:-8}"
     "actor_rollout_ref.rollout.drafter.training.dflash2_loss_decay_gamma=${SPECO_DFLASH2_LOSS_DECAY_GAMMA:-7}"

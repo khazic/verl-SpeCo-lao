@@ -299,7 +299,7 @@ def test_dflash2_engine_param_name_renames_only_the_codebooks() -> None:
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DFLASH2"])
-def test_dflash2_rejects_unregistered_qwen_architecture(tmp_path, algorithm):
+def test_dflash2_rejects_unregistered_qwen_architecture(tmp_path, algorithm) -> None:
     config = {**_DFLASH2_CONFIG, "architectures": ["Qwen3DFlash2Model"]}
     model_path = _write_drafter(tmp_path, config)
 

@@ -63,7 +63,7 @@ faster end-to-end training without accuracy regression.
 | EAGLE-2 | vLLM | FSDP | Available |
 | EAGLE3 | vLLM, SGLang | FSDP | Available |
 | DFlash | vLLM, SGLang | FSDP | Available |
-| DFlash2 | vLLM via DFlash | FSDP | Available |
+| DFlash2 | vLLM via DFlash, SGLang via DFLASH | FSDP | Available |
 | DSpark | vLLM | FSDP | Available |
 | Domino | vLLM, SGLang via DFlash | FSDP | Available |
 | P-EAGLE | Not wired in this overlay | FSDP | Training only |
@@ -96,7 +96,7 @@ drafter backend you use.
 | EAGLE-1 / EAGLE-2 | Engine version with native EAGLE support | Runtime-specific | - |
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
-| DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | - |
+| DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | [main](https://github.com/sgl-project/sglang) (served as DFLASH; no tagged release up to 0.5.18) |
 | DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | - |
 | Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
 | P-EAGLE | Not wired | Not wired | Not wired |
@@ -113,8 +113,20 @@ DFlash2. The checkpoint must use the z-lab layout with the DFlash2 knobs under
 speculators-format drafter (for example `mgoin/Qwen3-4B-speculator.dflash2`) into
 it. vLLM sizes the convolution block as the bonus token plus
 `rollout.spec_verify_tokens`, so set `spec_verify_tokens = dflash2_block_size - 1`
-(see `examples/run_qwen3-8b_drafter_dflash2_vllm.sh`). SGLang co-training of
-DFlash2 is not wired yet.
+(see `examples/run_qwen3-8b_drafter_dflash2_vllm.sh`).
+
+For SGLang DFlash2, also keep `speculative_algorithm=DFLASH2`: the overlay maps
+it onto SGLang's DFLASH speculative worker, which builds the DFlash2 modules
+from the checkpoint's `DFlash2DraftModel` architecture and `dflash_config`.
+This needs an sglang build from main (no tagged release up to 0.5.18 ships the
+DFlash2 draft). Note the block contract differs from vLLM: SGLang uses
+`spec_verify_tokens` directly as the DFlash block size, so set
+`spec_verify_tokens = dflash2_block_size` (8 by default; see
+`examples/run_qwen3-8b_drafter_dflash2_sglang.sh`). sglang main also rejects
+`return_hidden_states` for the DFLASH worker, so collect the training hidden
+states from the old-logprob pass
+(`training.collect_hidden_states_from_old_logprob=true`) rather than
+`collect_hidden_states_from_sgl`.
 
 For vLLM DSpark on GPU, use vLLM main. The NPU example uses vLLM's V1 engine
 with the native vLLM-Ascend ModelRunnerV2 DSpark implementation. The pinned

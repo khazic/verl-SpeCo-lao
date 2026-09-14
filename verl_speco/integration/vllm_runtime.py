@@ -850,7 +850,7 @@ def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
 
 
 # Draft architectures vLLM can serve through its DFlash speculative path.
-# Keep in sync with the alias sets in verl_speco/models/auto.py.
+# vLLM registers DFlash2DraftModel; trainer-only architecture aliases are excluded.
 _DFLASH2_SERVABLE_ARCHITECTURES = frozenset({"DFlash2DraftModel"})
 _DFLASH_SERVABLE_ARCHITECTURES = frozenset(
     {"DFlashDraftModel", *_DFLASH2_SERVABLE_ARCHITECTURES}
@@ -960,6 +960,23 @@ def _dflash2_config_value(config: dict[str, Any], key: str) -> Any:
     )
 
 
+def _resolve_dflash2_block_size(
+    drafter_cfg: dict[str, Any], config: dict[str, Any] | None
+) -> int | None:
+    """The trained DFlash2 conv block size.
+
+    ``drafter.training.dflash2_block_size`` wins over the checkpoint's
+    ``dflash_config`` (the trainer pins its convolutions to the former); both
+    the vLLM and the SGLang block-size validators resolve through here so the
+    precedence cannot drift between engines.
+    """
+    training_cfg = drafter_cfg.get("training") or {}
+    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
+    if block_size is None and config is not None:
+        block_size = _positive_int_or_none(_dflash2_config_value(config, "block_size"))
+    return block_size
+
+
 def _validate_vllm_dflash2_block_size(
     config: dict[str, Any] | None,
     drafter_cfg: dict[str, Any],
@@ -974,10 +991,7 @@ def _validate_vllm_dflash2_block_size(
     (or vice versa), which shows up as a silently weak drafter rather than an
     error, so refuse the mismatch here.
     """
-    training_cfg = drafter_cfg.get("training") or {}
-    block_size = _positive_int_or_none(training_cfg.get("dflash2_block_size"))
-    if block_size is None and config is not None:
-        block_size = _positive_int_or_none(_dflash2_config_value(config, "block_size"))
+    block_size = _resolve_dflash2_block_size(drafter_cfg, config)
     if block_size is None:
         return
     if int(num_speculative_tokens) + 1 != int(block_size):
@@ -1007,8 +1021,9 @@ def _load_vllm_dflash_drafter_config(spec_model_path: Any) -> dict[str, Any] | N
 def _validate_vllm_dflash_drafter_config(
     spec_model_path: Any,
     algorithm: str = "DFLASH",
-    num_speculative_tokens: int | None = None,
     config: dict[str, Any] | None = None,
+    engine: str = "vLLM",
+    num_speculative_tokens: int | None = None,
 ) -> None:
     if config is None:
         config = _load_vllm_dflash_drafter_config(spec_model_path)
@@ -1024,7 +1039,7 @@ def _validate_vllm_dflash_drafter_config(
         # checkpoint would load fine and silently serve without them.
         if _DFLASH2_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
             raise ValueError(
-                "vLLM DFLASH2 requires actor_rollout_ref.rollout.drafter.model_path to point "
+                f"{engine} DFLASH2 requires actor_rollout_ref.rollout.drafter.model_path to point "
                 "to a DFlash2 drafter checkpoint with architectures in "
                 f"{sorted(_DFLASH2_SERVABLE_ARCHITECTURES)}; got architectures={architectures!r} "
                 f"from {config_path}. Use speculative_algorithm=DFLASH for a plain DFlash drafter."
@@ -1036,7 +1051,7 @@ def _validate_vllm_dflash_drafter_config(
         ]
         if missing:
             raise ValueError(
-                "vLLM DFLASH2 requires the drafter config.json to carry the DFlash2 "
+                f"{engine} DFLASH2 requires the drafter config.json to carry the DFlash2 "
                 f"hyperparameters {list(_DFLASH2_RUNTIME_KEYS)} (top level or under dflash_config); "
                 f"missing {missing} in {config_path}."
             )
@@ -1307,7 +1322,6 @@ def build_vllm_speculative_config_from_drafter(
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
     if method in ("dflash", "dspark"):
-        drafter_checkpoint_config = _load_vllm_dflash_drafter_config(spec_model_path)
         num_speculative_tokens = _positive_int_or_none(
             rollout_drafter_cfg.get("spec_verify_tokens")
         )
@@ -1316,12 +1330,13 @@ def build_vllm_speculative_config_from_drafter(
                 "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens "
                 f"must be positive for vLLM {method.upper()} speculative decoding"
             )
+        drafter_checkpoint_config = _load_vllm_dflash_drafter_config(spec_model_path)
         if method == "dflash" or algorithm == "DSPARK":
             _validate_vllm_dflash_drafter_config(
                 spec_model_path,
                 algorithm=algorithm,
-                num_speculative_tokens=num_speculative_tokens,
                 config=drafter_checkpoint_config,
+                num_speculative_tokens=num_speculative_tokens,
             )
         if algorithm == "DFLASH2":
             _assert_vllm_supports_dflash2()
@@ -2620,14 +2635,16 @@ def _ipc_safe_allocator(enabled: bool):
 
     CUDA tensors shared over IPC out of an expandable segment carry an fd-based
     handle that the receiver can only import through ``pidfd_getfd`` (Linux >=
-    5.6); on older kernels the vLLM worker fails the whole draft update with
+    5.6); on older kernels the rollout worker fails the whole draft update with
     "does not support the pidfd_getfd syscall". verl's own actor->rollout sync
-    flips expandable segments off around its send for the same reason and turns
-    them back on afterwards, so the draft publish mirrors that. Restoring
-    ``True`` unconditionally (torch has no public getter for the prior state)
-    matches the state verl's own per-step sync leaves behind on every verl that
-    ships the helper; a verl without it never enabled expandable segments, and
-    the ImportError guard then leaves the allocator untouched.
+    flips expandable segments off around its send for the same reason. Torch has
+    no public getter for the prior state, so this guard deliberately leaves them
+    OFF instead of guessing: turning them on after the send would poison later
+    allocations in environments that never enabled them (e.g.
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False``), while verl's own
+    sync re-enables them at the end of every step on the verl versions that use
+    them at all. A verl without the helper never enabled expandable segments,
+    and the ImportError guard then leaves the allocator untouched.
     """
     if not enabled:
         yield
@@ -2641,7 +2658,14 @@ def _ipc_safe_allocator(enabled: bool):
     try:
         yield
     finally:
-        set_expandable_segments(True)
+        # Torch has no getter for the live setting, so restore only what the
+        # process explicitly asked for: re-enable expandable segments when
+        # PYTORCH_CUDA_ALLOC_CONF requests them, and otherwise leave them off
+        # (re-enabling unconditionally would poison later allocations in runs
+        # that never turned them on; verl's own per-step sync re-enables them
+        # where it wants them).
+        if "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""):
+            set_expandable_segments(True)
 
 
 async def speco_vllm_update_draft_weights(
