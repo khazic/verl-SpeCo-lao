@@ -902,11 +902,17 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        intermediate_size_cfg = self._training_value(
+            training_cfg, "dspark_intermediate_size", "dflash_intermediate_size", None
+        )
+        intermediate_size = int(
+            intermediate_size_cfg
+            if intermediate_size_cfg is not None
+            else getattr(target_text_config, "intermediate_size", hidden_size * 4)
+        )
         return DSparkConfig(
             hidden_size=hidden_size,
-            intermediate_size=int(
-                getattr(target_text_config, "intermediate_size", hidden_size * 4)
-            ),
+            intermediate_size=intermediate_size,
             num_hidden_layers=int(
                 self._training_value(
                     training_cfg,

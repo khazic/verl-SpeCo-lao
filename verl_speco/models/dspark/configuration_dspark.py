@@ -20,6 +20,28 @@ from typing import Optional
 
 from verl_speco.models.dflash import DFlashConfig
 
+# Speculators snapshots nest the transformer architecture under
+# ``transformer_layer_config``; mirror ``convert_speculators_dflash2`` and copy
+# these keys into the flat config used to build the draft model.
+_SPECULATOR_TRANSFORMER_KEYS = (
+    "attention_bias",
+    "attention_dropout",
+    "head_dim",
+    "hidden_act",
+    "hidden_size",
+    "initializer_range",
+    "intermediate_size",
+    "max_position_embeddings",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "rms_norm_eps",
+    "rope_scaling",
+    "rope_theta",
+    "rope_parameters",
+    "vocab_size",
+)
+
 
 class DSparkConfig(DFlashConfig):
     """Configuration for the DSpark draft model.
@@ -85,6 +107,22 @@ class DSparkConfig(DFlashConfig):
         source_config = deepcopy(config)
         internal_config = deepcopy(config)
         internal_config["model_type"] = cls.model_type
+        # Speculators snapshots nest the transformer architecture under
+        # ``transformer_layer_config``; normalize it before building the config
+        # so the released draft checkpoint matches the constructed model.
+        transformer = internal_config.pop("transformer_layer_config", None)
+        if isinstance(transformer, dict):
+            for key in _SPECULATOR_TRANSFORMER_KEYS:
+                value = transformer.get(key)
+                if value is not None:
+                    internal_config[key] = value
+            rope_parameters = transformer.get("rope_parameters")
+            if (
+                internal_config.get("rope_theta") is None
+                and isinstance(rope_parameters, dict)
+                and rope_parameters.get("rope_theta") is not None
+            ):
+                internal_config["rope_theta"] = rope_parameters["rope_theta"]
         if "enable_confidence_head" not in internal_config:
             internal_config["enable_confidence_head"] = (
                 float(internal_config.get("confidence_head_alpha", 0.0)) > 0.0

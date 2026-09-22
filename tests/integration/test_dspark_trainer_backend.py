@@ -548,3 +548,68 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_from_dspark_dict_normalizes_transformer_layer_config() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+    assert config.hidden_size == 64
+    assert config.intermediate_size == 128
+    assert config.num_hidden_layers == 2
+    assert config.num_attention_heads == 4
+    assert config.num_key_value_heads == 2
+    assert config.vocab_size == 128
+    assert config.block_size == 8
+
+
+def test_dspark_fallback_prefers_dspark_intermediate_size() -> None:
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    backend = dspark_backend.DSparkTrainerBackend.__new__(
+        dspark_backend.DSparkTrainerBackend
+    )
+    backend.config = OmegaConf.create(
+        {
+            "actor": {"fsdp_config": {}},
+            "rollout": {
+                "drafter": {"training": {"dspark_intermediate_size": 6144}}
+            },
+        }
+    )
+    target = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=40,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        vocab_size=151936,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=32768,
+        head_dim=None,
+        rope_theta=10000.0,
+    )
+
+    selected = backend._build_fallback_config(target)
+    assert selected.intermediate_size == 6144
+
+    backend.config.rollout.drafter.training.dspark_intermediate_size = None
+    defaulted = backend._build_fallback_config(target)
+    # MoE targets have no dense intermediate_size, so hidden_size * 4 is used.
+    assert defaulted.intermediate_size == 2048 * 4
