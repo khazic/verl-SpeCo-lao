@@ -57,6 +57,9 @@ speco:
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
     pending_poll_interval_seconds: 0.5
+    # After publishing EOS the producer waits until the consumer clears every
+    # published sample before closing the remote client. Bound that wait with
+    # SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS (default 1800; 0 disables).
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
     max_feature_length: 512
@@ -336,3 +339,15 @@ actor_rollout_ref:
             SimpleStorage:
               total_storage_size: 100000
               num_data_storage_units: 8
+            MooncakeStore:
+              # auto_init=false requires an external mooncake_master reachable
+              # at master_server_address; the standalone launcher probes it and
+              # fails fast otherwise. Set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let
+              # TransferQueue start (and own) the master instead.
+              auto_init: false
+              metadata_server: P2PHANDSHAKE
+              master_server_address: 127.0.0.1:50051
+              local_hostname: ""
+              protocol: tcp
+              global_segment_size: 4294967296
+              local_buffer_size: 2147483648

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -185,6 +186,7 @@ async def run_producer(
     if max_consecutive_feature_drops < 0:
         raise ValueError("max_consecutive_feature_drops must be >= 0")
     connected = False
+    completed = False
     pool = client_pool
     feature_executor: ThreadPoolExecutor | None = None
     try:
@@ -711,6 +713,7 @@ async def run_producer(
             )
         eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
+        completed = True
         logger.info(
             "Standalone TQ Producer completed inputs=%s published=%s dropped=%s",
             stats.input_count,
@@ -728,6 +731,23 @@ async def run_producer(
                     feature_executor.shutdown(wait=True)
         finally:
             if connected:
+                if completed:
+                    # Closing a remote store client unmounts the producer's
+                    # segment; wait until the consumer has fetched and cleared
+                    # every sample before releasing it.
+                    await _drain_pending_samples(
+                        transport,
+                        run_id,
+                        timeout=float(
+                            os.environ.get(
+                                "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
+                            )
+                            or 0
+                        ),
+                        poll_interval=float(
+                            producer_cfg["pending_poll_interval_seconds"]
+                        ),
+                    )
                 transport.close_transfer_queue_client()
 
 
@@ -774,6 +794,51 @@ async def _wait_for_pending_capacity(
             )
         )
         if ready_count < max_pending_samples:
+            return
+        await asyncio.sleep(poll_interval)
+
+
+async def _drain_pending_samples(
+    transport: Any,
+    run_id: str,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> None:
+    """Wait until the consumer has fetched and cleared every published sample.
+
+    Closing a remote store client unmounts the producer segment, so samples a
+    slow consumer has not fetched yet would be dropped. The consumer deletes
+    consumed records, therefore an empty ready set means everything was acked.
+    A fixed linger cannot guarantee this; ``timeout`` only bounds a stalled
+    consumer and logs a warning instead of failing the (already completed) run.
+    """
+
+    if timeout <= 0:
+        return
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        records = await asyncio.to_thread(transport.list_samples)
+        pending = sum(
+            1
+            for tag in records.values()
+            if is_ready_sample_tag(
+                tag,
+                run_id=run_id,
+                schema_version=PROTOCOL_SCHEMA_VERSION,
+            )
+        )
+        if pending == 0:
+            logger.info(
+                "Standalone TQ Producer drained; the consumer cleared all samples"
+            )
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.warning(
+                "Standalone TQ Producer drain timed out with %s unconsumed "
+                "samples; closing the client may drop them",
+                pending,
+            )
             return
         await asyncio.sleep(poll_interval)
 

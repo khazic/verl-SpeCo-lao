@@ -24,10 +24,21 @@ import pytest
 import torch
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
-from verl_speco.standalone_tq_producer import run_producer, validate_producer_config
+from verl_speco.standalone_tq_producer import (
+    _drain_pending_samples,
+    run_producer,
+    validate_producer_config,
+)
 from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 from verl_speco.transport.drafter_sample_protocol import decode_sample
+
+
+@pytest.fixture(autouse=True)
+def _disable_consumer_drain(monkeypatch):
+    # Unit tests use a fake transport whose consumer never clears samples.
+    # Skip the post-run drain wait; the drain logic has dedicated tests below.
+    monkeypatch.setenv("SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "0")
 
 
 @pytest.fixture(autouse=True)
@@ -839,3 +850,65 @@ def test_run_producer_preserves_explicit_zero_max_consecutive_errors(
                 client_pool=pool,
             )
         )
+
+
+def _ready_tag(sequence_no: int = 0) -> dict[str, Any]:
+    return {
+        "record_type": "sample",
+        "status": "ready",
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
+        "run_id": "run-a",
+        "sample_id": f"sample-{sequence_no}",
+        "sequence_no": sequence_no,
+    }
+
+
+def test_drain_pending_samples_returns_after_consumer_clears() -> None:
+    class _DrainTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            self.calls += 1
+            # Emulate a consumer that acks the batch on its third poll.
+            if self.calls >= 3:
+                return {}
+            return {"sample:0": _ready_tag()}
+
+    transport = _DrainTransport()
+    asyncio.run(
+        _drain_pending_samples(
+            transport, "run-a", timeout=5.0, poll_interval=0.0
+        )
+    )
+    assert transport.calls >= 3
+
+
+def test_drain_pending_samples_times_out_without_failing() -> None:
+    class _StuckTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            self.calls += 1
+            return {"sample:0": _ready_tag()}
+
+    transport = _StuckTransport()
+    asyncio.run(
+        _drain_pending_samples(
+            transport, "run-a", timeout=0.05, poll_interval=0.0
+        )
+    )
+    assert transport.calls >= 1
+
+
+def test_drain_pending_samples_disabled_with_zero_timeout() -> None:
+    class _UnexpectedTransport:
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            raise AssertionError("drain must not poll when disabled")
+
+    asyncio.run(
+        _drain_pending_samples(
+            _UnexpectedTransport(), "run-a", timeout=0.0, poll_interval=0.0
+        )
+    )

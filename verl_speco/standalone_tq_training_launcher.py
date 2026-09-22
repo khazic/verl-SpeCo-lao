@@ -30,6 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,9 @@ _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = "0.4"
 _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
 _TQ_NAMESPACE = "speco-drafter"
 _TQ_PARTITION = "speco_drafter_features"
+_TQ_STORAGE_BACKENDS = ("SimpleStorage", "MooncakeStore")
+_MOONCAKE_MASTER_DEFAULT = "127.0.0.1:50051"
+_MOONCAKE_AUTO_INIT_DEFAULT = False
 
 
 @dataclass(frozen=True)
@@ -449,14 +453,126 @@ def _replace_internal_overrides(
     return [*cleaned, *internal]
 
 
+def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_tq_backend(env: Mapping[str, str]) -> str:
+    """Return the selected TQ storage backend, rejecting unknown values.
+
+    A typo or case mismatch must not silently fall back to the in-memory
+    ``SimpleStorage`` backend when a remote store was intended.
+    """
+    backend = str(env.get("SPECO_TQ_STORAGE_BACKEND", "SimpleStorage")).strip()
+    if backend not in _TQ_STORAGE_BACKENDS:
+        raise RuntimeError(
+            f"Unsupported SPECO_TQ_STORAGE_BACKEND={backend!r}; expected one of "
+            f"{list(_TQ_STORAGE_BACKENDS)}."
+        )
+    return backend
+
+
+def _mooncake_master_address(env: Mapping[str, str]) -> tuple[str, int]:
+    raw = str(env.get("SPECO_TQ_MOONCAKE_MASTER", _MOONCAKE_MASTER_DEFAULT)).strip()
+    host, _, port = raw.rpartition(":")
+    if not host or not port.isdigit():
+        raise RuntimeError(f"SPECO_TQ_MOONCAKE_MASTER must be host:port, got {raw!r}")
+    return host, int(port)
+
+
+def validate_tq_backend(
+    env: Mapping[str, str],
+    *,
+    connect: Callable[..., Any] | None = None,
+    timeout: float = 2.0,
+) -> None:
+    """Fail fast when the selected TQ transport cannot possibly work.
+
+    ``MooncakeStore`` with ``auto_init=false`` needs an external
+    ``mooncake_master``; TransferQueue only starts one itself when auto-init is
+    on. Probe the master address up front so the pipeline raises an actionable
+    error instead of failing deep inside the owner.
+    """
+    backend = _resolve_tq_backend(env)
+    if backend != "MooncakeStore":
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT):
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_SKIP_PRECHECK", False):
+        # Multi-node setups may not be able to reach the master from the
+        # launcher host even though the training workers can.
+        return
+    host, port = _mooncake_master_address(env)
+    probe = connect if connect is not None else socket.create_connection
+    try:
+        probe((host, port), timeout=timeout).close()
+    except OSError as exc:
+        raise RuntimeError(
+            "MooncakeStore backend selected with SPECO_TQ_MOONCAKE_AUTO_INIT=false, "
+            f"but no mooncake_master is reachable at {host}:{port} ({exc}). Start "
+            "mooncake_master there, or set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let "
+            "TransferQueue start one."
+        ) from exc
+
+
+def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
+    """Internal TQ storage-backend overrides.
+
+    Transport backend selection is not exposed through the Hydra CLI. It
+    defaults to the in-memory ``SimpleStorage``; set
+    ``SPECO_TQ_STORAGE_BACKEND=MooncakeStore`` to use a Mooncake store
+    (``SPECO_TQ_MOONCAKE_*`` tune its client configuration).
+    """
+    backend = _resolve_tq_backend(env)
+
+    def _env(name: str, default: str) -> str:
+        return str(env.get(name, default)).strip()
+
+    if backend == "MooncakeStore":
+        auto_init = _env_flag(
+            env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT
+        )
+        return [
+            f"{_TQ_PREFIX}.backend.storage_backend=MooncakeStore",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.auto_init={str(auto_init).lower()}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.metadata_server="
+            f"{_env('SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.master_server_address="
+            f"{_env('SPECO_TQ_MOONCAKE_MASTER', _MOONCAKE_MASTER_DEFAULT)}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_hostname="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.protocol="
+            f"{_env('SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.global_segment_size="
+            f"{_env('SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_buffer_size="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
+        ]
+    return [
+        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+    ]
+
+
 def build_pipeline_commands(
     config: PipelineConfig,
     training_args: Sequence[str],
     *,
     ray_address: str,
     python_executable: str = sys.executable,
+    env: Mapping[str, str] | None = None,
 ) -> PipelineCommands:
-    """Build the internal commands without exposing transport options."""
+    """Build the internal commands without exposing transport options.
+
+    ``env`` selects the TQ storage backend (defaults to ``os.environ``); pass
+    the same mapping to :func:`run_pipeline` so backend selection and master
+    validation read one source.
+    """
+    backend_env = os.environ if env is None else env
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
@@ -475,9 +591,7 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.partition_id={_TQ_PARTITION}",
         f"{_TQ_PREFIX}.run_id={config.run_id}",
         f"{_TQ_PREFIX}.drop_last=true",
-        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+        *_tq_backend_overrides(backend_env),
     ]
     parsed_endpoint = urlparse(config.vllm_endpoints[0])
     vllm_port = parsed_endpoint.port or (
@@ -709,6 +823,7 @@ def run_pipeline(
     # torchrun ranks created by the Consumer launcher) to the control plane
     # created above instead of allowing a stale inherited value to win.
     base_env["RAY_ADDRESS"] = ray_address
+    validate_tq_backend(base_env)
     owner: subprocess.Popen[Any] | None = None
     producer: subprocess.Popen[Any] | None = None
     consumer: subprocess.Popen[Any] | None = None

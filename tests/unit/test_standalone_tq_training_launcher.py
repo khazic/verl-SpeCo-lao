@@ -24,10 +24,12 @@ from verl_speco.standalone_tq_training_launcher import (
     _preflight_input_file,
     _producer_max_samples,
     _target_final_layer_id,
+    _tq_backend_overrides,
     build_pipeline_commands,
     resolve_pipeline_config,
     run_pipeline,
     start_ray_session,
+    validate_tq_backend,
 )
 import verl_speco.tq_owner as tq_owner
 
@@ -468,3 +470,126 @@ def test_owner_writes_internal_ready_file(monkeypatch, tmp_path) -> None:
 
     assert tq_owner.run_owner(config, stop_event=stop_event) == 0
     assert ready_file.is_file()
+
+
+def test_validate_tq_backend_ignores_non_mooncake_backend() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("SimpleStorage must not probe a Mooncake master")
+
+    validate_tq_backend({}, connect=_unexpected)
+    validate_tq_backend({"SPECO_TQ_STORAGE_BACKEND": "SimpleStorage"}, connect=_unexpected)
+
+
+def test_validate_tq_backend_skips_when_auto_init_enabled() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("auto_init=true lets TransferQueue start the master")
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_AUTO_INIT": "true",
+        },
+        connect=_unexpected,
+    )
+
+
+def test_validate_tq_backend_accepts_reachable_master() -> None:
+    probed: list[tuple[str, int]] = []
+
+    class _Connection:
+        def close(self) -> None:
+            probed.append(("closed", 0))
+
+    def connect(address, *, timeout):
+        probed.append(address)
+        return _Connection()
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_MASTER": "mooncake-host:50051",
+        },
+        connect=connect,
+    )
+    assert probed[0] == ("mooncake-host", 50051)
+
+
+def test_validate_tq_backend_fails_fast_when_master_unreachable() -> None:
+    def connect(address, *, timeout):
+        raise OSError("connection refused")
+
+    with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
+        validate_tq_backend(
+            {"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
+            connect=connect,
+        )
+
+
+def test_validate_tq_backend_rejects_malformed_master_address() -> None:
+    with pytest.raises(RuntimeError, match="host:port"):
+        validate_tq_backend(
+            {
+                "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+                "SPECO_TQ_MOONCAKE_MASTER": "no-port",
+            },
+            connect=lambda *args, **kwargs: None,
+        )
+
+
+@pytest.mark.parametrize("backend", ["Mooncake", "mooncakestore", "MoonCakeStore", ""])
+def test_validate_tq_backend_rejects_unknown_backend(backend) -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("unknown backends must not be probed")
+
+    with pytest.raises(RuntimeError, match="Unsupported SPECO_TQ_STORAGE_BACKEND"):
+        validate_tq_backend(
+            {"SPECO_TQ_STORAGE_BACKEND": backend}, connect=_unexpected
+        )
+
+
+@pytest.mark.parametrize("backend", ["Mooncake", "mooncakestore", "MoonCakeStore", ""])
+def test_tq_backend_overrides_reject_unknown_backend(backend) -> None:
+    with pytest.raises(RuntimeError, match="Unsupported SPECO_TQ_STORAGE_BACKEND"):
+        _tq_backend_overrides({"SPECO_TQ_STORAGE_BACKEND": backend})
+
+
+def test_tq_backend_overrides_accept_explicit_simple_storage() -> None:
+    overrides = _tq_backend_overrides({"SPECO_TQ_STORAGE_BACKEND": "SimpleStorage"})
+    assert any("backend.storage_backend=SimpleStorage" in item for item in overrides)
+
+
+def test_tq_backend_overrides_accept_mooncake_store() -> None:
+    overrides = _tq_backend_overrides(
+        {"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"}
+    )
+    assert any("backend.storage_backend=MooncakeStore" in item for item in overrides)
+
+
+def test_validate_tq_backend_skips_probe_when_disabled() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("the precheck must be skipped when disabled")
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_SKIP_PRECHECK": "true",
+        },
+        connect=_unexpected,
+    )
+
+
+def test_pipeline_commands_use_provided_env_for_backend() -> None:
+    config = resolve_pipeline_config(_training_args(), environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        _training_args(),
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+        env={"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
+    )
+
+    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer)
+    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer)
+
+
