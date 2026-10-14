@@ -1,4 +1,0 @@
-# Preserve the supplied experiment snapshots exactly, including line endings.
-*.log.txt -text -diff
-*.sh -text
-*.png -text
