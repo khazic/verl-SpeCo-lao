@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # Synchronous OPD co-train | DSpark drafter | vLLM rollout | FSDP2 | NVIDIA GPUs
+# vLLM rollout only: teacher prefill timing is not collected on the SGLang path.
+# Defaults mirror the reported 8B-student / 32B-teacher experiment (6 GPUs).
 
 set -xeuo pipefail
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}
 export PYTHONUNBUFFERED=1
 
 # ---- user-adjustable ----
-STUDENT_MODEL=${STUDENT_MODEL:-/path/to/Qwen3-4B}
+STUDENT_MODEL=${STUDENT_MODEL:-/path/to/Qwen3-8B}
 TEACHER_MODEL=${TEACHER_MODEL:-/path/to/Qwen3-32B}
-# Must be a vLLM-compatible DSpark checkpoint built for STUDENT_MODEL.
-DRAFTER_MODEL=${DRAFTER_MODEL:-/path/to/dspark_qwen3_4b_block7}
+# Must be a vLLM-compatible DSpark checkpoint built for STUDENT_MODEL whose
+# config.json matches the DSPARK_* settings below (block_size, layers, ...).
+DRAFTER_MODEL=${DRAFTER_MODEL:-/path/to/dspark_qwen3_8b}
 
-# Student training/rollout share 2 GPUs; the OPD teacher uses another 2 GPUs.
+# Student training/rollout share 4 GPUs; the OPD teacher uses another 2 GPUs.
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-2}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-2}
 
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
@@ -51,12 +54,12 @@ dspark_markov_rank=${DSPARK_MARKOV_RANK:-256}
 dspark_markov_head_type=${DSPARK_MARKOV_HEAD_TYPE:-vanilla}
 dspark_num_anchors=${DSPARK_NUM_ANCHORS:-64}
 
-total_epochs=${TOTAL_EPOCHS:-15}
+total_epochs=${TOTAL_EPOCHS:-6}
 total_training_steps=${TOTAL_TRAINING_STEPS:-200}
 save_freq=${SAVE_FREQ:-500}
 test_freq=${TEST_FREQ:-25}
 project_name=${PROJECT_NAME:-verl_opd_cotrain_gsm8k_math}
-experiment_name=${EXPERIMENT_NAME:-qwen3_4b_from_qwen3_32b_dspark_vllm_fsdp2}
+experiment_name=${EXPERIMENT_NAME:-qwen3_8b_from_qwen3_32b_dspark_vllm_fsdp2}
 # ---- end user-adjustable ----
 
 gsm8k_train=/path/to/datasets/gsm8k/train.parquet
@@ -167,6 +170,7 @@ TRAINER=(
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
     trainer.nnodes=${NNODES}
     trainer.val_before_train=False
+    trainer.resume_mode=disable
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}

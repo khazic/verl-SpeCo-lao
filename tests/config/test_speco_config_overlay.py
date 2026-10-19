@@ -200,7 +200,10 @@ def test_opd_drafter_modes_compose_with_fsdp2(
 
     validate_sync_opd_cotrain_config(config)
     assert config.actor_rollout_ref.actor.strategy == "fsdp2"
-    assert "drafter" not in config.distillation.teacher_models.teacher_model.inference
+    teacher_inference = config.distillation.teacher_models.teacher_model.get(
+        "inference"
+    )
+    assert teacher_inference is None or "drafter" not in teacher_inference
 
 
 def test_veomni_trainer_composes_with_release_upstream_verl(tmp_path: Path) -> None:

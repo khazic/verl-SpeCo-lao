@@ -212,7 +212,7 @@ def _speco_reset_context(*tokens: Any) -> None:
 def _record_phase_time(output: Any, key: str, elapsed: float) -> None:
     extra_fields = getattr(output, "extra_fields", None)
     if isinstance(extra_fields, dict):
-        extra_fields[key] = elapsed
+        extra_fields[key] = extra_fields.get(key, 0.0) + elapsed
 
 
 async def _compute_teacher_logprobs_with_timing(
@@ -224,7 +224,11 @@ async def _compute_teacher_logprobs_with_timing(
     validate: bool,
     sample_kwargs: Any = None,
 ) -> Any:
-    """Run upstream teacher scoring and record its end-to-end prefill latency."""
+    """Run upstream teacher scoring and record its end-to-end prefill latency.
+
+    Latency is accumulated per output. Only installed on the vLLM agent-loop
+    worker path; the SGLang worker path does not record teacher prefill time.
+    """
 
     measure = bool(getattr(worker, "distillation_enabled", False)) and not validate
     started = time.perf_counter() if measure else None

@@ -46,33 +46,6 @@ def distillation_enabled(config: Any) -> bool:
     return _as_bool(_get_nested(config, ("distillation", "enabled"), False))
 
 
-def opd_cotrain_enabled(config: Any) -> bool:
-    """Return whether OPD and online drafter training are both enabled."""
-
-    return bool(
-        distillation_enabled(config)
-        and _as_bool(
-            _get_nested(
-                config,
-                ("actor_rollout_ref", "rollout", "drafter", "enable"),
-                False,
-            )
-        )
-        and _as_bool(
-            _get_nested(
-                config,
-                (
-                    "actor_rollout_ref",
-                    "rollout",
-                    "drafter",
-                    "enable_drafter_training",
-                ),
-                False,
-            )
-        )
-    )
-
-
 def _validate_teacher_configs(config: Any) -> None:
     teacher_models = _get_nested(config, ("distillation", "teacher_models"), {})
     items = teacher_models.items() if hasattr(teacher_models, "items") else ()
@@ -100,8 +73,6 @@ def validate_sync_opd_cotrain_config(config: Any) -> None:
     if not distillation_enabled(config):
         return
 
-    _validate_teacher_configs(config)
-
     drafter_path = ("actor_rollout_ref", "rollout", "drafter")
     rollout_enabled = _as_bool(_get_nested(config, drafter_path + ("enable",), False))
     training_enabled = _as_bool(
@@ -115,6 +86,8 @@ def validate_sync_opd_cotrain_config(config: Any) -> None:
         )
     if not (rollout_enabled and training_enabled):
         return
+
+    _validate_teacher_configs(config)
 
     actor_strategy = str(
         _get_nested(config, ("actor_rollout_ref", "actor", "strategy"), "") or ""

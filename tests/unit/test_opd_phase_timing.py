@@ -12,6 +12,7 @@ from verl_speco.integration.agent_loop_runtime import (
     SPECO_TEACHER_PREFILL_TIME_KEY,
     _CURRENT_STUDENT_DECODE_TIMES,
     _compute_teacher_logprobs_with_timing,
+    _record_phase_time,
     _run_agent_loop_with_student_timing,
 )
 
@@ -81,3 +82,12 @@ def test_teacher_prefill_timing_is_skipped_for_validation() -> None:
     )
 
     assert SPECO_TEACHER_PREFILL_TIME_KEY not in output.extra_fields
+
+
+def test_teacher_prefill_timing_accumulates_across_calls() -> None:
+    output = SimpleNamespace(extra_fields={})
+
+    _record_phase_time(output, SPECO_TEACHER_PREFILL_TIME_KEY, 0.25)
+    _record_phase_time(output, SPECO_TEACHER_PREFILL_TIME_KEY, 0.5)
+
+    assert output.extra_fields[SPECO_TEACHER_PREFILL_TIME_KEY] == 0.75
