@@ -229,7 +229,8 @@ def _speco_reset_context(*tokens: Any) -> None:
 def _record_phase_time(output: Any, key: str, elapsed: float) -> None:
     extra_fields = getattr(output, "extra_fields", None)
     if isinstance(extra_fields, dict):
-        extra_fields[key] = extra_fields.get(key, 0.0) + elapsed
+        previous = extra_fields.get(key)
+        extra_fields[key] = (0.0 if previous is None else previous) + elapsed
 
 
 async def _compute_teacher_logprobs_with_timing(

@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_STUDENT_DECODE_TIME_KEY,
     SPECO_TEACHER_PREFILL_TIME_KEY,
@@ -91,3 +93,15 @@ def test_teacher_prefill_timing_accumulates_across_calls() -> None:
     _record_phase_time(output, SPECO_TEACHER_PREFILL_TIME_KEY, 0.5)
 
     assert output.extra_fields[SPECO_TEACHER_PREFILL_TIME_KEY] == 0.75
+
+
+@pytest.mark.parametrize(
+    "key", [SPECO_STUDENT_DECODE_TIME_KEY, SPECO_TEACHER_PREFILL_TIME_KEY]
+)
+def test_phase_timing_accumulates_from_none_default(key) -> None:
+    output = SimpleNamespace(extra_fields={key: None})
+
+    _record_phase_time(output, key, 0.25)
+    _record_phase_time(output, key, 0.5)
+
+    assert output.extra_fields[key] == 0.75
