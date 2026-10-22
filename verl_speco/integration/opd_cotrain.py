@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from verl_speco.trainer.scheduler import DrafterExecutionStrategy, DrafterScheduleConfig
+
 
 TEACHER_TENSOR_KEYS = frozenset({"teacher_ids", "teacher_logprobs"})
 
@@ -100,17 +102,16 @@ def validate_sync_opd_cotrain_config(config: Any) -> None:
         )
 
     training_path = drafter_path + ("training",)
-    execution_strategy = str(
-        _get_nested(
-            config, training_path + ("scheduler", "execution", "strategy"), "sync"
-        )
-    ).lower()
-    if execution_strategy != "sync":
+    training_config = _get_nested(config, training_path, {})
+    execution_strategy = DrafterScheduleConfig.from_mapping(
+        training_config
+    ).execution_strategy
+    if execution_strategy is not DrafterExecutionStrategy.SYNC:
         raise ValueError(
             "Synchronous OPD Co-Train requires "
             "actor_rollout_ref.rollout.drafter.training.scheduler.execution.strategy=sync; "
             "Teacher replicas are not isolated from the Student drafter runtime "
-            f"for non-sync execution, got {execution_strategy!r}"
+            f"for non-sync execution, got {execution_strategy.value!r}"
         )
     training_mode = str(
         _get_nested(config, training_path + ("mode",), "online") or "online"
