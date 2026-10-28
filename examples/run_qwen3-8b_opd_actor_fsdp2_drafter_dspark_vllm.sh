@@ -121,6 +121,7 @@ DRAFTER=(
     actor_rollout_ref.rollout.drafter.model_path="$DRAFTER_MODEL"
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK
     actor_rollout_ref.rollout.drafter.training.mode=online
+    actor_rollout_ref.rollout.drafter.training.scheduler.execution.strategy=sync
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook
