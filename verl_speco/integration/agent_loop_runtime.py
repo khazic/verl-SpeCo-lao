@@ -30,6 +30,8 @@ _PATCHED = False
 SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
+    "_speco_vllm_spec_decode_accepted_tokens",
+    "_speco_vllm_spec_decode_drafts",
     "turn_scores",
     "tool_rewards",
     "min_global_steps",
